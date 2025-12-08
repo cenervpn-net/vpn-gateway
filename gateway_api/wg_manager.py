@@ -56,7 +56,7 @@ class WireGuardManager:
                         break
                     
                     result = subprocess.run(
-                        ["/usr/bin/sudo", "/usr/bin/wg"] + cmd,
+                        ["/usr/bin/sudo", "/usr/bin/awg"] + cmd,
                         capture_output=True,
                         text=True
                     )
