@@ -47,6 +47,24 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Peer reconstruction failed: {e}")
 
+class ObfuscationConfig(BaseModel):
+    """AmneziaWG obfuscation parameters"""
+    enabled: bool = True
+    jc: Optional[int] = 3      # Junk packet count (0-128)
+    jmin: Optional[int] = 50   # Min junk size (0-1280)
+    jmax: Optional[int] = 1000 # Max junk size (0-1280)
+    s1: Optional[int] = 0      # Init packet junk size
+    s2: Optional[int] = 0      # Response packet junk size
+    s3: Optional[int] = 0      # Under load packet junk size
+    s4: Optional[int] = 0      # Transport packet junk size
+    h1: Optional[int] = 1      # Init packet magic header
+    h2: Optional[int] = 2      # Response packet magic header
+    h3: Optional[int] = 3      # Under load packet magic header
+    h4: Optional[int] = 4      # Transport packet magic header
+    
+    class Config:
+        extra = "allow"
+
 class ConfigCreate(BaseModel):
     # Legacy required fields
     public_key: str
@@ -57,6 +75,9 @@ class ConfigCreate(BaseModel):
     tunnel_traffic: Optional[List[str]] = ['ipv4']  # Legacy default
     port: Optional[int] = 51820  # Legacy default
     dns: Optional[str] = 'd1'  # Legacy default
+    
+    # AmneziaWG obfuscation parameters
+    obfuscation: Optional[ObfuscationConfig] = None
     
     # Add this field to capture the encrypted payload
     encrypted_payload: Optional[str] = None
@@ -123,8 +144,11 @@ async def create_configuration(
             if 'port' in decrypted_data:
                 config.port = decrypted_data['port']
                 logger.debug(f"Updated port to: {config.port}")
+            if 'obfuscation' in decrypted_data:
+                config.obfuscation = ObfuscationConfig(**decrypted_data['obfuscation'])
+                logger.debug(f"Updated obfuscation to: {config.obfuscation.dict()}")
             
-            logger.debug(f"Updated config with decrypted values: protocol={config.protocol}, tunnel_traffic={config.tunnel_traffic}")
+            logger.debug(f"Updated config with decrypted values: protocol={config.protocol}, tunnel_traffic={config.tunnel_traffic}, obfuscation={config.obfuscation}")
         except Exception as e:
             logger.error(f"Failed to decrypt payload: {e}")
             logger.error(f"Encrypted payload (first 50 chars): {config.encrypted_payload[:50]}...")
@@ -136,12 +160,14 @@ async def create_configuration(
     if existing_config:
         return {"status": "exists"}
     
-    # Add WireGuard peer (returns success, ipv4, ipv6)
+    # Add WireGuard peer with obfuscation (returns success, ipv4, ipv6)
+    obfuscation_params = config.obfuscation.dict() if config.obfuscation else None
     success, assigned_ipv4, assigned_ipv6 = wg.add_peer(
         config.public_key,
         protocol=config.protocol,
         tunnel_traffic=config.tunnel_traffic,
-        port=config.port
+        port=config.port,
+        obfuscation=obfuscation_params
     )
     
     if not success:
@@ -158,7 +184,27 @@ async def create_configuration(
     logger.debug(f"dns_choice: {config.dns}")
     logger.debug(f"allowed_ips: {wg.get_allowed_ips(config.tunnel_traffic)}")
 
-    # Save both IPv4 and IPv6 addresses
+    # Prepare obfuscation parameters for database
+    obf_params = {}
+    if config.obfuscation:
+        obf = config.obfuscation
+        obf_params = {
+            'obfuscation_enabled': obf.enabled,
+            'junk_packet_count': obf.jc,
+            'junk_packet_min_size': obf.jmin,
+            'junk_packet_max_size': obf.jmax,
+            'init_packet_junk_size': obf.s1,
+            'response_packet_junk_size': obf.s2,
+            'underload_packet_junk_size': obf.s3,
+            'transport_packet_junk_size': obf.s4,
+            'init_packet_magic_header': obf.h1,
+            'response_packet_magic_header': obf.h2,
+            'underload_packet_magic_header': obf.h3,
+            'transport_packet_magic_header': obf.h4
+        }
+        logger.debug(f"Storing obfuscation parameters: {obf_params}")
+    
+    # Save both IPv4 and IPv6 addresses with obfuscation
     new_config = WGConfig(
         public_key=config.public_key,
         status="active",
@@ -167,7 +213,8 @@ async def create_configuration(
         assigned_port=config.port,
         tunnel_traffic=config.tunnel_traffic,
         dns_choice=config.dns,
-        allowed_ips=','.join(wg.get_allowed_ips(config.tunnel_traffic))  # Convert list to string
+        allowed_ips=','.join(wg.get_allowed_ips(config.tunnel_traffic)),  # Convert list to string
+        **obf_params  # Unpack obfuscation parameters
     )
     db.add(new_config)
     db.commit()

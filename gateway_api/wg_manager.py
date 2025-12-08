@@ -129,8 +129,8 @@ class WireGuardManager:
 
             return ipv4, ipv6
 
-    def add_peer(self, public_key, protocol=None, tunnel_traffic=['ipv4'], port=51820, assigned_ipv4=None, assigned_ipv6=None):
-        """Add a new peer with optimized IP assignment"""
+    def add_peer(self, public_key, protocol=None, tunnel_traffic=['ipv4'], port=51820, assigned_ipv4=None, assigned_ipv6=None, obfuscation=None):
+        """Add a new peer with optimized IP assignment and AmneziaWG obfuscation"""
         try:
             # Ensure tunnel_traffic is not empty
             if not tunnel_traffic:
@@ -140,7 +140,7 @@ class WireGuardManager:
             use_ipv4 = 'ipv4' in tunnel_traffic
             use_ipv6 = 'ipv6' in tunnel_traffic
             
-            logger.info(f"Adding peer: {public_key} (protocol: {protocol}, tunnel: {tunnel_traffic})")
+            logger.info(f"Adding peer: {public_key} (protocol: {protocol}, tunnel: {tunnel_traffic}, obfuscation: {bool(obfuscation)})")
             
             # Generate IP addresses or reuse previously assigned ones
             if assigned_ipv4 is None and use_ipv4:
@@ -162,15 +162,44 @@ class WireGuardManager:
             if not allowed_ips:
                 raise Exception("No valid IP addresses assigned")
             
-            # Add peer to WireGuard with optimized settings
-            cmd = [
-                "set", self.interface,
+            # Build AWG command with obfuscation parameters
+            cmd = ["set", self.interface]
+            
+            # Add obfuscation parameters if provided and enabled
+            if obfuscation and obfuscation.get('enabled', True):
+                logger.info(f"Applying obfuscation parameters: {obfuscation}")
+                if 'jc' in obfuscation and obfuscation['jc'] is not None:
+                    cmd.extend(["jc", str(obfuscation['jc'])])
+                if 'jmin' in obfuscation and obfuscation['jmin'] is not None:
+                    cmd.extend(["jmin", str(obfuscation['jmin'])])
+                if 'jmax' in obfuscation and obfuscation['jmax'] is not None:
+                    cmd.extend(["jmax", str(obfuscation['jmax'])])
+                if 's1' in obfuscation and obfuscation['s1'] is not None and obfuscation['s1'] > 0:
+                    cmd.extend(["s1", str(obfuscation['s1'])])
+                if 's2' in obfuscation and obfuscation['s2'] is not None and obfuscation['s2'] > 0:
+                    cmd.extend(["s2", str(obfuscation['s2'])])
+                if 's3' in obfuscation and obfuscation['s3'] is not None and obfuscation['s3'] > 0:
+                    cmd.extend(["s3", str(obfuscation['s3'])])
+                if 's4' in obfuscation and obfuscation['s4'] is not None and obfuscation['s4'] > 0:
+                    cmd.extend(["s4", str(obfuscation['s4'])])
+                if 'h1' in obfuscation and obfuscation['h1'] is not None:
+                    cmd.extend(["h1", str(obfuscation['h1'])])
+                if 'h2' in obfuscation and obfuscation['h2'] is not None:
+                    cmd.extend(["h2", str(obfuscation['h2'])])
+                if 'h3' in obfuscation and obfuscation['h3'] is not None:
+                    cmd.extend(["h3", str(obfuscation['h3'])])
+                if 'h4' in obfuscation and obfuscation['h4'] is not None:
+                    cmd.extend(["h4", str(obfuscation['h4'])])
+            
+            # Add peer configuration
+            cmd.extend([
                 "peer", public_key,
                 "allowed-ips", ",".join(allowed_ips),
                 "persistent-keepalive", "25",
                 "endpoint", f"0.0.0.0:{port}"  # Allow connections from any IP
-            ]
+            ])
             
+            logger.info(f"AWG command: {' '.join(cmd)}")
             self.run_wg_command(cmd)
             
             # Update assigned IPs
