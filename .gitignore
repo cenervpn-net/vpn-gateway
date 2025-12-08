@@ -1,0 +1,57 @@
+# Secrets and Credentials
+.env
+*.pem
+*.key
+privatekey
+publickey
+*.ovpn
+
+# Database files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Backups
+*.bak
+*.backup
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Deployment
+deployment-vars.yaml
+gateway-*.yaml
+credentials.enc
+
