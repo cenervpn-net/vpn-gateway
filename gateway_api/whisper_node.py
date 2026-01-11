@@ -542,7 +542,7 @@ def send_heartbeat_to_peer(peer_ip: str, our_state: WhisperState) -> bool:
             f"https://{peer_ip}:{WHISPER_PORT}/whisper",
             json=msg,
             timeout=5,
-            verify=False
+            verify=CA_CERT_PATH if os.path.exists(CA_CERT_PATH) else False
         )
         
         return response.status_code == 200
@@ -573,7 +573,7 @@ def broadcast_suspect_to_peers(suspect_name: str, suspect_ip: str, last_seen: st
                 f"https://{peer_info.mgmt_ip}:{WHISPER_PORT}/whisper/suspect-report",
                 json=report,
                 timeout=5,
-                verify=False
+                verify=CA_CERT_PATH if os.path.exists(CA_CERT_PATH) else False
             )
             if response.status_code == 200:
                 logger.debug(f"Sent suspect report about {suspect_name} to {peer_name}")

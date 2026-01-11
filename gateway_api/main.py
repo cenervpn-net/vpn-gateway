@@ -1161,7 +1161,8 @@ async def get_admin_summary(
 async def stop_service(
     service_name: str,
     signature: str = Header(...),
-    timestamp: str = Header(...)
+    timestamp: str = Header(...),
+    x_nonce: str = Header(None, alias="X-Nonce")  # Optional nonce for replay protection
 ):
     """Stop a systemd service (admin only, HMAC authenticated)"""
     # Validate service name
@@ -1169,10 +1170,10 @@ async def stop_service(
     if service_name not in allowed_services:
         raise HTTPException(status_code=400, detail=f"Invalid service: {service_name}")
     
-    # Verify HMAC using standard verify_admin_request (60s window, body-bound)
+    # Verify HMAC with optional nonce for replay protection
     # Body includes service_name to bind the action
     body = json.dumps({"service": service_name, "action": "stop"})
-    verify_admin_request(signature, timestamp, body)
+    verify_admin_request(signature, timestamp, body, nonce=x_nonce)
     
     # Stop the service
     try:
@@ -1194,7 +1195,8 @@ async def stop_service(
 async def start_service(
     service_name: str,
     signature: str = Header(...),
-    timestamp: str = Header(...)
+    timestamp: str = Header(...),
+    x_nonce: str = Header(None, alias="X-Nonce")  # Optional nonce for replay protection
 ):
     """Start a systemd service (admin only, HMAC authenticated)"""
     # Validate service name
@@ -1202,9 +1204,9 @@ async def start_service(
     if service_name not in allowed_services:
         raise HTTPException(status_code=400, detail=f"Invalid service: {service_name}")
     
-    # Verify HMAC using standard verify_admin_request (60s window, body-bound)
+    # Verify HMAC with optional nonce for replay protection
     body = json.dumps({"service": service_name, "action": "start"})
-    verify_admin_request(signature, timestamp, body)
+    verify_admin_request(signature, timestamp, body, nonce=x_nonce)
     
     # Start the service
     try:
@@ -1225,7 +1227,8 @@ async def start_service(
 @app.post("/admin/wipe")
 async def wipe_gateway(
     signature: str = Header(...),
-    timestamp: str = Header(...)
+    timestamp: str = Header(...),
+    x_nonce: str = Header(None, alias="X-Nonce")  # Optional nonce for replay protection
 ):
     """
     Complete wipe of gateway ecosystem data.
@@ -1239,10 +1242,10 @@ async def wipe_gateway(
     
     WARNING: This is destructive and cannot be undone!
     """
-    # Verify HMAC using standard verify_admin_request (60s window, body-bound)
+    # Verify HMAC with optional nonce for replay protection
     # Include action identifier in body to prevent replay for different actions
     body = json.dumps({"action": "wipe", "confirm": True})
-    verify_admin_request(signature, timestamp, body)
+    verify_admin_request(signature, timestamp, body, nonce=x_nonce)
     
     logger.warning("⚠️ WIPE COMMAND RECEIVED - Beginning gateway wipe...")
     
