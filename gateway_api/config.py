@@ -23,8 +23,7 @@ class Settings(BaseSettings):
         'd3': '9.9.9.9'     # Quad9
     }
 
-    # Database
-    DB_PATH: str = "./wireguard.db"
+    # RAM-only mode: No database - peers are stored in memory and recovered from mesh
 
     model_config = {
         "env_file": ".env",

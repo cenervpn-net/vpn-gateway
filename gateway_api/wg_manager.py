@@ -109,6 +109,56 @@ class WireGuardManager:
                 ipv6_addr = f"{prefix}::2:{i:04x}"
                 self.available_ipv6s.add(ipv6_addr)
 
+    def generate_ip_for_interface(self, interface: str, ip_type: str) -> Optional[str]:
+        """Generate IP address for specific interface using its subnet"""
+        import os
+        import ipaddress
+        from dotenv import dotenv_values
+        
+        # Load env from file
+        env_path = os.path.join(os.path.dirname(__file__), '.env')
+        env_vars = dotenv_values(env_path)
+        
+        # Get subnet from env
+        if ip_type == 'ipv4':
+            env_key = f"INTERFACE_{interface}_IPV4_SUBNET"
+            subnet_str = env_vars.get(env_key, "10.0.1.0/24")
+        else:
+            env_key = f"INTERFACE_{interface}_IPV6_SUBNET"
+            subnet_str = env_vars.get(env_key, "fd42:4242:1::/64")
+        
+        try:
+            network = ipaddress.ip_network(subnet_str, strict=False)
+            # Get existing peers to avoid conflicts
+            existing_ips = set()
+            try:
+                result = subprocess.run(
+                    ["sudo", "awg", "show", interface, "allowed-ips"],
+                    capture_output=True, text=True
+                )
+                for line in result.stdout.strip().split("\n"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        for ip_cidr in parts[1].split(","):
+                            ip = ip_cidr.split("/")[0]
+                            existing_ips.add(ip)
+            except:
+                pass
+            
+            # Find next available IP (skip .0, .1 - gateway address)
+            for i, ip in enumerate(network.hosts()):
+                if i == 0:  # Skip gateway address
+                    continue
+                if str(ip) not in existing_ips:
+                    logger.info(f"Generated IP {ip} for interface {interface}")
+                    return str(ip)
+            
+            raise Exception(f"No available IPs in {subnet_str}")
+        except Exception as e:
+            logger.error(f"Failed to generate IP for {interface}: {e}")
+            # Fallback to default
+            return self.generate_ip_addresses(ip_type)[0 if ip_type == 'ipv4' else 1]
+
     def generate_ip_addresses(self, protocol: str) -> Tuple[Optional[str], Optional[str]]:
         """Thread-safe IP address generation"""
         with self._ip_lock:
@@ -129,9 +179,14 @@ class WireGuardManager:
 
             return ipv4, ipv6
 
-    def add_peer(self, public_key, protocol=None, tunnel_traffic=['ipv4'], port=51820, assigned_ipv4=None, assigned_ipv6=None, obfuscation=None):
+    def add_peer(self, public_key, protocol=None, tunnel_traffic=['ipv4'], port=51820, assigned_ipv4=None, assigned_ipv6=None, obfuscation=None, obfuscation_level='off'):
         """Add a new peer with optimized IP assignment and AmneziaWG obfuscation"""
         try:
+            # Map obfuscation_level to interface
+            interface_map = {'off': 'wg0', 'basic': 'wg1', 'high': 'wg2', 'stealth': 'wg3'}
+            target_interface = interface_map.get(obfuscation_level, 'wg0')
+            logger.info(f"Obfuscation level '{obfuscation_level}' -> interface {target_interface}")
+            
             # Ensure tunnel_traffic is not empty
             if not tunnel_traffic:
                 tunnel_traffic = ['ipv4']  # Default to IPv4 if tunnel_traffic is empty
@@ -142,15 +197,15 @@ class WireGuardManager:
             
             logger.info(f"Adding peer: {public_key} (protocol: {protocol}, tunnel: {tunnel_traffic}, obfuscation: {bool(obfuscation)})")
             
-            # Generate IP addresses or reuse previously assigned ones
+            # Generate IP addresses for target interface
             if assigned_ipv4 is None and use_ipv4:
-                assigned_ipv4, _ = self.generate_ip_addresses('ipv4')
+                assigned_ipv4 = self.generate_ip_for_interface(target_interface, 'ipv4')
             if assigned_ipv6 is None and use_ipv6:
-                _, assigned_ipv6 = self.generate_ip_addresses('ipv6')
+                assigned_ipv6 = self.generate_ip_for_interface(target_interface, 'ipv6')
             
             # Ensure at least one IP address is assigned
             if not assigned_ipv4 and not assigned_ipv6:
-                assigned_ipv4, _ = self.generate_ip_addresses('ipv4')
+                assigned_ipv4 = self.generate_ip_for_interface(target_interface, 'ipv4')
                 
             # Build allowed IPs
             allowed_ips = []
@@ -163,7 +218,7 @@ class WireGuardManager:
                 raise Exception("No valid IP addresses assigned")
             
             # Build AWG command with obfuscation parameters
-            cmd = ["set", self.interface]
+            cmd = ["set", target_interface]
             
             # Add obfuscation parameters if provided and enabled
             if obfuscation and obfuscation.get('enabled', True):
@@ -196,7 +251,6 @@ class WireGuardManager:
                 "peer", public_key,
                 "allowed-ips", ",".join(allowed_ips),
                 "persistent-keepalive", "25",
-                "endpoint", f"0.0.0.0:{port}"  # Allow connections from any IP
             ])
             
             logger.info(f"AWG command: {' '.join(cmd)}")
@@ -217,74 +271,71 @@ class WireGuardManager:
             return False, None, None
 
     def remove_peer(self, public_key: str) -> bool:
-        """Remove a peer with cleanup"""
+        """Remove a peer from all interfaces"""
         try:
-            if not self.verify_peer_exists(public_key):
-                return True
-
-            # Get peer's IPs before removal
-            result = self.run_wg_command(["show", self.interface])
-            peer_ips = []
-            for line in result.stdout.split('\n'):
-                if public_key in line:
-                    if "allowed ips:" in line.lower():
-                        ips = line.split(':')[1].strip().split(',')
-                        peer_ips = [ip.strip().split('/')[0] for ip in ips]
-
-            # Remove peer
-            cmd = ["set", self.interface, "peer", public_key, "remove"]
-            self.run_wg_command(cmd)
-
-            # Clean up IPs
-            with self._ip_lock:
-                for ip in peer_ips:
-                    if ':' in ip:  # IPv6
-                        self.assigned_ipv6s.discard(ip)
-                    else:  # IPv4
-                        self.assigned_ipv4s.discard(ip)
-
-            logger.info(f"Removed peer: {public_key}")
-            return True
+            removed = False
+            # Check all interfaces for this peer
+            for interface in ['wg0', 'wg1', 'wg2', 'wg3']:
+                try:
+                    result = self.run_wg_command(["show", interface])
+                    if public_key in result.stdout:
+                        # Get peer's IPs before removal
+                        peer_ips = []
+                        for line in result.stdout.split('\n'):
+                            if "allowed ips:" in line.lower():
+                                ips = line.split(':')[1].strip().split(',')
+                                peer_ips = [ip.strip().split('/')[0] for ip in ips if ip.strip()]
+                        
+                        # Remove peer from this interface
+                        cmd = ["set", interface, "peer", public_key, "remove"]
+                        self.run_wg_command(cmd)
+                        logger.info(f"Removed peer {public_key} from {interface}")
+                        removed = True
+                        
+                        # Clean up IPs
+                        with self._ip_lock:
+                            for ip in peer_ips:
+                                if ':' in ip:  # IPv6
+                                    self.assigned_ipv6s.discard(ip)
+                                else:  # IPv4
+                                    self.assigned_ipv4s.discard(ip)
+                except Exception as e:
+                    logger.debug(f"Interface {interface} check failed: {e}")
+                    continue
+            
+            return removed
         except Exception as e:
             logger.error(f"Failed to remove peer: {e}")
             return False
 
     def sync_assigned_ips(self):
-        """Sync assigned IPs with thread safety"""
+        """Sync assigned IPs from WireGuard state (RAM-only mode)"""
         with self._ip_lock:
             try:
                 # Clear current sets
                 self.assigned_ipv4s.clear()
                 self.assigned_ipv6s.clear()
                 
-                # Get IPs from WireGuard
-                try:
-                    result = self.run_wg_command(["show", self.interface])
-                    for line in result.stdout.split('\n'):
-                        if "allowed ips:" in line.lower():
-                            ips = line.split(':')[1].strip().split(',')
-                            for ip in ips:
-                                ip = ip.strip().split('/')[0]
-                                if ':' in ip:  # IPv6
-                                    self.assigned_ipv6s.add(ip)
-                                else:  # IPv4
-                                    self.assigned_ipv4s.add(ip)
-                except Exception as e:
-                    logger.warning(f"Failed to get IPs from WireGuard: {e}")
+                # Get IPs from all WireGuard interfaces
+                all_interfaces = ['wg0', 'wg1', 'wg2', 'wg3']
+                for interface in all_interfaces:
+                    try:
+                        result = self.run_wg_command(["show", interface, "allowed-ips"])
+                        for line in result.stdout.splitlines():
+                            parts = line.strip().split('\t')
+                            if len(parts) >= 2:
+                                allowed_ips = parts[1].split(',')
+                                for ip_cidr in allowed_ips:
+                                    ip = ip_cidr.strip().split('/')[0]
+                                    if ip:
+                                        if ':' in ip:
+                                            self.assigned_ipv6s.add(ip)
+                                        else:
+                                            self.assigned_ipv4s.add(ip)
+                    except Exception as e:
+                        logger.debug(f"Could not check interface {interface}: {e}")
                 
-                # Get IPs from database
-                from database import SessionLocal
-                db = SessionLocal()
-                try:
-                    from models import WGConfig
-                    configs = db.query(WGConfig).all()
-                    for config in configs:
-                        if config.assigned_ip:
-                            self.assigned_ipv4s.add(config.assigned_ip)
-                        if config.assigned_ipv6:
-                            self.assigned_ipv6s.add(config.assigned_ipv6)
-                finally:
-                    db.close()
+                logger.info(f"IP sync: {len(self.assigned_ipv4s)} IPv4, {len(self.assigned_ipv6s)} IPv6")
                     
             except Exception as e:
                 logger.error(f"Failed to sync IPs: {e}")
@@ -342,73 +393,104 @@ class WireGuardManager:
             logger.error(f"Error getting total peer count: {str(e)}")
             return 0
 
-    def sync_and_reconstruct_peers(self):
-        """Thread-safe peer reconstruction"""
+    def get_interface_from_ip(self, ip_address: str) -> str:
+        """
+        Derive the WireGuard interface from the assigned IP address.
+        
+        IP Ranges by Interface:
+            wg0 (off):     10.5.30.x
+            wg1 (basic):   10.5.31.x
+            wg2 (high):    10.5.32.x
+            wg3 (stealth): 10.5.33.x
+        
+        Returns the interface name (wg0, wg1, wg2, wg3) or 'wg0' as default.
+        """
+        if not ip_address:
+            return 'wg0'
+        
         try:
-            # First get all current peers
-            result = self.run_wg_command(["show", self.interface, "peers"])
-            current_peers = [peer.strip() for peer in result.stdout.splitlines() if peer.strip()]
+            # Extract the third octet from the IP
+            parts = ip_address.split('.')
+            if len(parts) >= 3:
+                third_octet = int(parts[2])
+                interface_map = {
+                    30: 'wg0',  # off
+                    31: 'wg1',  # basic
+                    32: 'wg2',  # high
+                    33: 'wg3',  # stealth
+                }
+                return interface_map.get(third_octet, 'wg0')
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Could not derive interface from IP {ip_address}: {e}")
+        
+        return 'wg0'  # Default fallback
+
+    def get_obfuscation_level_from_ip(self, ip_address: str) -> str:
+        """
+        Derive the obfuscation level from the assigned IP address.
+        
+        IP Ranges to Obfuscation Level:
+            10.5.30.x -> 'off'
+            10.5.31.x -> 'basic'
+            10.5.32.x -> 'high'
+            10.5.33.x -> 'stealth'
+        """
+        interface = self.get_interface_from_ip(ip_address)
+        level_map = {
+            'wg0': 'off',
+            'wg1': 'basic',
+            'wg2': 'high',
+            'wg3': 'stealth'
+        }
+        return level_map.get(interface, 'off')
+
+    def sync_assigned_ips_from_wireguard(self):
+        """
+        Sync assigned IP tracking from current WireGuard state.
+        
+        This is used in RAM-only mode to ensure IP tracking is accurate
+        without wiping peers. Just reads current peers and tracks their IPs.
+        """
+        try:
+            all_interfaces = ['wg0', 'wg1', 'wg2', 'wg3']
             
-            # Remove each peer individually
-            for peer in current_peers:
-                try:
-                    self.run_wg_command(["set", self.interface, "peer", peer, "remove"])
-                    logger.info(f"Removed peer: {peer}")
-                except Exception as e:
-                    logger.warning(f"Failed to remove peer {peer}: {e}")
-            
-            # Clear assigned IPs
             with self._ip_lock:
                 self.assigned_ipv4s.clear()
                 self.assigned_ipv6s.clear()
             
-            # Reconstruct from database
-            from database import SessionLocal
-            db = SessionLocal()
-            try:
-                from models import WGConfig
-                active_configs = db.query(WGConfig).filter(WGConfig.status == 'active').all()
-                
-                # Process peers in batches
-                for i in range(0, len(active_configs), BATCH_SIZE):
-                    batch = active_configs[i:i + BATCH_SIZE]
-                    for config in batch:
-                        try:
-                            # Ensure tunnel_traffic is valid
-                            tunnel_traffic = config.tunnel_traffic
-                            if not tunnel_traffic:
-                                tunnel_traffic = ['ipv4']  # Default to IPv4
-                                
-                            success, ipv4, ipv6 = self.add_peer(
-                                config.public_key,
-                                protocol='dual' if config.assigned_ipv6 else None,
-                                tunnel_traffic=tunnel_traffic,
-                                port=config.assigned_port or 51820,  # Default to 51820 if port is None
-                                assigned_ipv4=config.assigned_ip,
-                                assigned_ipv6=config.assigned_ipv6
-                            )
-                            if success:
-                                logger.info(f"Reconstructed peer: {config.public_key}")
-                                with self._ip_lock:
-                                    if ipv4:
-                                        self.assigned_ipv4s.add(ipv4)
-                                    if ipv6:
-                                        self.assigned_ipv6s.add(ipv6)
-                            else:
-                                logger.warning(f"Failed to reconstruct peer: {config.public_key}")
-                        except Exception as e:
-                            logger.error(f"Error reconstructing peer {config.public_key}: {e}")
-                    
-                    # Small delay between batches to prevent overload
-                    time.sleep(0.1)
+            for interface in all_interfaces:
+                try:
+                    result = self.run_wg_command(["show", interface, "allowed-ips"])
+                    for line in result.stdout.splitlines():
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 2:
+                            allowed_ips = parts[1].split(',')
+                            for ip_cidr in allowed_ips:
+                                ip = ip_cidr.strip().split('/')[0]
+                                if ip:
+                                    if ':' in ip:
+                                        self.assigned_ipv6s.add(ip)
+                                    else:
+                                        self.assigned_ipv4s.add(ip)
+                except Exception as e:
+                    logger.debug(f"Could not check interface {interface}: {e}")
             
-            finally:
-                db.close()
-            
-            logger.info(f"Reconstructed {len(self.assigned_ipv4s) + len(self.assigned_ipv6s)} active peers")
+            logger.info(f"IP sync complete: {len(self.assigned_ipv4s)} IPv4, {len(self.assigned_ipv6s)} IPv6 tracked")
             
         except Exception as e:
-            logger.error(f"Peer reconstruction failed: {e}")
+            logger.error(f"Failed to sync IPs from WireGuard: {e}")
+
+    def sync_and_reconstruct_peers(self):
+        """
+        DEPRECATED: This function was used for SQLite-based peer reconstruction.
+        
+        In RAM-only mode, peer reconstruction is handled by:
+        1. main.py startup_event() - recovers peers from mesh
+        2. sync_assigned_ips_from_wireguard() - syncs IP tracking
+        
+        This function is kept for backwards compatibility but does nothing.
+        """
+        logger.warning("sync_and_reconstruct_peers() is deprecated in RAM-only mode - use mesh recovery instead")
 
     def get_allowed_ips(self, tunnel_traffic: List[str]) -> List[str]:
         """Get allowed IPs based on tunnel traffic configuration"""

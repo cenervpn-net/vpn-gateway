@@ -1,7 +1,7 @@
 [Unit]
 Description=WireGuard/AmneziaWG Management API
-After=network.target awg-quick@wg0.service
-Requires=awg-quick@wg0.service
+After=network.target awg-quick@wg0.service awg-quick@wg1.service awg-quick@wg2.service awg-quick@wg3.service
+Requires=awg-quick@wg0.service awg-quick@wg1.service awg-quick@wg2.service awg-quick@wg3.service
 
 [Service]
 User=ubuntu
