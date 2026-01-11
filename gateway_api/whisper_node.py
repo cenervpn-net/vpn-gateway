@@ -891,7 +891,8 @@ async def purge_peer_data(request: PurgeRequest, s: WhisperState = Depends(get_s
 class PurgeBlobRequest(BaseModel):
     """Request to purge a specific peer blob"""
     identity_pubkey: str
-    blob_hash: str
+    blob_hash: str = ""  # Match by blob_hash or peer_id
+    peer_id: str = ""    # Hash of peer public_key (preferred for deletion)
     peer_public_key: str = ""
     reason: str = "peer_deleted"
     timestamp: str = ""
@@ -923,11 +924,13 @@ async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(g
     so deleted peers cannot be accidentally recovered.
     
     Called by gateway when a peer is deleted.
+    Matches by peer_id (preferred) or blob_hash.
     """
     global peer_recovery_store, recovery_events
     
     identity = request.identity_pubkey
     blob_hash = request.blob_hash
+    peer_id = request.peer_id
     
     if identity not in peer_recovery_store:
         return {"status": "not_found", "message": "No data for this identity"}
@@ -936,11 +939,17 @@ async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(g
     blobs = peer_recovery_store[identity]["blobs"]
     original_count = len(blobs)
     
-    # Remove blobs matching the hash (or containing the peer_public_key in config)
-    peer_recovery_store[identity]["blobs"] = [
-        b for b in blobs 
-        if b.get("blob_hash") != blob_hash
-    ]
+    # Remove blobs matching by peer_id (preferred) or blob_hash
+    def should_keep(b):
+        # Match by peer_id if provided (preferred for deletion)
+        if peer_id and b.get("peer_id") == peer_id:
+            return False
+        # Match by blob_hash if provided
+        if blob_hash and b.get("blob_hash") == blob_hash:
+            return False
+        return True
+    
+    peer_recovery_store[identity]["blobs"] = [b for b in blobs if should_keep(b)]
     
     removed_count = original_count - len(peer_recovery_store[identity]["blobs"])
     
@@ -950,12 +959,14 @@ async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(g
         logger.info(f"Removed last blob for identity {identity[:16]}... - identity entry cleaned up")
     
     if removed_count > 0:
-        logger.info(f"PURGED blob {blob_hash[:16]}... for identity {identity[:16]}... - reason: {request.reason}")
+        match_key = peer_id[:16] if peer_id else blob_hash[:16] if blob_hash else "unknown"
+        logger.info(f"PURGED blob (match: {match_key}...) for identity {identity[:16]}... - reason: {request.reason}")
         
         recovery_events.append({
             "type": "BLOB_PURGED",
             "identity_hash": hashlib.sha256(identity.encode()).hexdigest()[:16],
-            "blob_hash": blob_hash[:16],
+            "peer_id": peer_id[:16] if peer_id else "",
+            "blob_hash": blob_hash[:16] if blob_hash else "",
             "reason": request.reason,
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
