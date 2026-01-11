@@ -230,9 +230,8 @@ class MeshPeerSync:
                 elif info.get("pubkey"):
                     mesh_peers[ip] = info.get("pubkey")
             
-            # Include sender's own pubkey for self-recovery via backend nodes
-            my_pubkey = self.identity.public_key_b64()
-            mesh_peers[my_pubkey] = my_pubkey
+            # Note: For self-recovery via backend nodes, the sender's wrapped_key
+            # is included in the blob by the crypto layer during encryption
         
         if not mesh_peers:
             logger.warning("No mesh peers configured - skipping broadcast")
