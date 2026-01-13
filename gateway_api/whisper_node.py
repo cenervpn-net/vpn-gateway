@@ -32,6 +32,7 @@ from pydantic import BaseModel
 WHISPER_PORT = 8100
 QUORUM_SIZE = 2  # Number of gateways that must agree peer is dead
 HEARTBEAT_INTERVAL = 30  # seconds - how often to send heartbeats
+MESH_SYNC_INTERVAL = 600  # seconds (10 minutes) - periodic mesh sync to catch missed updates
 PEER_TIMEOUT = 90  # seconds - mark peer as suspect after this
 SUSPECT_REPORT_THRESHOLD = 2  # How many peers must report suspect before we report to backend
 # Backend connectivity over wg_mgmt tunnel (already encrypted by WireGuard)
@@ -730,6 +731,66 @@ def heartbeat_worker():
             time.sleep(5)
 
 
+def mesh_sync_worker():
+    """
+    Background thread that periodically syncs blobs from the mesh.
+    
+    This catches any blobs that were missed due to:
+    - Network issues during broadcast
+    - Gateway restarts
+    - Timing issues between gateways
+    
+    Runs every MESH_SYNC_INTERVAL seconds (default: 10 minutes).
+    """
+    global peer_recovery_store
+    
+    logger.info(f"Mesh sync worker started (interval: {MESH_SYNC_INTERVAL}s)")
+    
+    # Wait for initial startup sync to complete
+    time.sleep(30)
+    
+    while True:
+        try:
+            time.sleep(MESH_SYNC_INTERVAL)
+            
+            logger.info("Periodic mesh sync starting...")
+            
+            # Import here to avoid circular imports
+            from mesh_peer_sync import sync_from_mesh
+            import asyncio
+            
+            # Get count before sync
+            before_count = sum(len(d.get("blobs", [])) for d in peer_recovery_store.values())
+            
+            # Run the async sync function
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # If loop is already running (uvicorn), create a task
+                    future = asyncio.run_coroutine_threadsafe(
+                        sync_from_mesh(peer_recovery_store),
+                        loop
+                    )
+                    result = future.result(timeout=60)
+                else:
+                    result = loop.run_until_complete(sync_from_mesh(peer_recovery_store))
+            except RuntimeError:
+                # No event loop, create one
+                result = asyncio.run(sync_from_mesh(peer_recovery_store))
+            
+            # Get count after sync
+            after_count = sum(len(d.get("blobs", [])) for d in peer_recovery_store.values())
+            
+            if after_count > before_count:
+                logger.info(f"Periodic mesh sync: discovered {after_count - before_count} new blob(s)")
+            else:
+                logger.debug(f"Periodic mesh sync complete: {after_count} total blobs (no changes)")
+            
+        except Exception as e:
+            logger.error(f"Mesh sync worker error: {e}")
+            time.sleep(30)  # Wait longer on error
+
+
 # =============================================================================
 # Peer Data Sync (VPN Peer Configurations) - Secure Recovery Protocol
 # =============================================================================
@@ -1041,48 +1102,6 @@ async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(g
         return {"status": "purged", "blobs_removed": removed_count}
     
     return {"status": "not_found", "message": "Blob not found"}
-
-
-# Purge entire identity (for orphaned blob cleanup)
-class PurgeIdentityRequest(BaseModel):
-    identity_hash: str  # First 16 chars of identity pubkey hash
-
-@app.post("/whisper/purge-identity")
-async def purge_identity_by_hash(request: PurgeIdentityRequest, s: WhisperState = Depends(get_state)):
-    """Purge all blobs for an identity by its hash (for orphaned blob cleanup)"""
-    global peer_recovery_store, recovery_events
-    
-    target_hash = request.identity_hash
-    
-    # Find matching identity by hash
-    found_identity = None
-    for identity in list(peer_recovery_store.keys()):
-        identity_hash = hashlib.sha256(identity.encode()).hexdigest()[:16]
-        if identity_hash == target_hash:
-            found_identity = identity
-            break
-    
-    if not found_identity:
-        return {"status": "not_found", "message": f"No identity matching hash {target_hash}"}
-    
-    blob_count = len(peer_recovery_store[found_identity].get("blobs", []))
-    del peer_recovery_store[found_identity]
-    
-    recovery_events.append({
-        "type": "IDENTITY_PURGED",
-        "identity_hash": target_hash,
-        "blobs_removed": blob_count,
-        "reason": "orphan_cleanup",
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
-    
-    logger.info(f"Purged orphaned identity {target_hash} ({blob_count} blobs)")
-    
-    return {
-        "status": "purged",
-        "identity_hash": target_hash,
-        "blobs_removed": blob_count
-    }
 
 
 @app.patch("/whisper/peer-data/status")
@@ -1576,6 +1595,11 @@ def run_server():
     heartbeat_thread = threading.Thread(target=heartbeat_worker, daemon=True)
     heartbeat_thread.start()
     logger.info("Mesh self-monitoring heartbeat worker started")
+    
+    # Start periodic mesh sync worker for catching missed updates
+    mesh_sync_thread = threading.Thread(target=mesh_sync_worker, daemon=True)
+    mesh_sync_thread.start()
+    logger.info("Periodic mesh sync worker started")
     
     # Check for certificates
     if not os.path.exists(CERT_PATH):

@@ -48,6 +48,11 @@ QUORUM_SIZE = 2  # Minimum peers that must agree
 MAX_RECOVERY_PEERS = 5  # Max peers to query for recovery
 RECOVERY_TIMEOUT = 30  # Seconds
 
+# Broadcast retry configuration
+BROADCAST_MAX_RETRIES = 3
+BROADCAST_INITIAL_DELAY = 1.0  # seconds
+BROADCAST_BACKOFF_MULTIPLIER = 2.0  # exponential backoff
+
 
 def parse_peer_address(addr: str) -> Tuple[str, int]:
     """
@@ -304,16 +309,38 @@ class MeshPeerSync:
                 protocol = "http" if is_backend else "https"
                 client_ctx = None if is_backend else ssl_ctx
                 
-                async with httpx.AsyncClient(verify=client_ctx, timeout=10.0) as client:
-                    resp = await client.post(
-                        f"{protocol}://{ip}:{port}/whisper/peer-data/store",
-                        json=payload
-                    )
-                    if resp.status_code == 200:
-                        success_count += 1
-                        logger.debug(f"Broadcast to {addr} successful")
-                    else:
-                        logger.warning(f"Broadcast to {addr} failed: {resp.status_code}")
+                # Retry with exponential backoff
+                delay = BROADCAST_INITIAL_DELAY
+                last_error = None
+                
+                for attempt in range(BROADCAST_MAX_RETRIES):
+                    try:
+                        async with httpx.AsyncClient(verify=client_ctx, timeout=10.0) as client:
+                            resp = await client.post(
+                                f"{protocol}://{ip}:{port}/whisper/peer-data/store",
+                                json=payload
+                            )
+                            if resp.status_code == 200:
+                                success_count += 1
+                                if attempt > 0:
+                                    logger.info(f"Broadcast to {addr} succeeded on retry {attempt + 1}")
+                                else:
+                                    logger.debug(f"Broadcast to {addr} successful")
+                                return  # Success, exit retry loop
+                            else:
+                                last_error = f"HTTP {resp.status_code}"
+                    except Exception as e:
+                        last_error = str(e)
+                    
+                    # If not last attempt, wait and retry
+                    if attempt < BROADCAST_MAX_RETRIES - 1:
+                        logger.debug(f"Broadcast to {addr} failed (attempt {attempt + 1}): {last_error}, retrying in {delay}s...")
+                        await asyncio.sleep(delay)
+                        delay *= BROADCAST_BACKOFF_MULTIPLIER
+                
+                # All retries failed
+                logger.warning(f"Broadcast to {addr} failed after {BROADCAST_MAX_RETRIES} attempts: {last_error}")
+                
             except Exception as e:
                 logger.warning(f"Failed to broadcast to {addr}: {e}")
         
