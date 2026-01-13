@@ -163,7 +163,9 @@ class PeerRecoveryCrypto:
         # Concatenate all WG private keys
         combined = b""
         for key_b64 in wg_private_keys:
-            key_bytes = base64.b64decode(key_b64)
+            # Add padding if needed (WG keys are 43 chars without padding)
+            padded_key = key_b64 + "=" * (4 - len(key_b64) % 4) if len(key_b64) % 4 else key_b64
+            key_bytes = base64.b64decode(padded_key)
             combined += key_bytes
         
         # Derive seed using HKDF
@@ -515,7 +517,10 @@ def load_wg_private_keys() -> List[str]:
         List of base64-encoded private keys [wg0, wg1, wg2, wg3]
     """
     keys = []
-    wg_config_dir = Path("/etc/wireguard")
+    # Try AmneziaWG first, then regular WireGuard
+    wg_config_dir = Path("/etc/amnezia/amneziawg")
+    if not wg_config_dir.exists():
+        wg_config_dir = Path("/etc/wireguard")
     
     for iface in ["wg0", "wg1", "wg2", "wg3"]:
         config_path = wg_config_dir / f"{iface}.conf"
