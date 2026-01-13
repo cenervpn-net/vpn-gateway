@@ -154,6 +154,7 @@ async def startup_event():
             
             interface_obf_map = {'wg0': 'off', 'wg1': 'basic', 'wg2': 'high', 'wg3': 'stealth'}
             recovered_from_wg = 0
+            seen_pubkeys = set()  # Deduplicate peers across interfaces
             
             for interface in ['wg0', 'wg1', 'wg2', 'wg3']:
                 try:
@@ -164,6 +165,12 @@ async def startup_event():
                     for public_key in result.stdout.strip().split('\n'):
                         if not public_key:
                             continue
+                        
+                        # Skip if we already processed this peer on another interface
+                        if public_key in seen_pubkeys:
+                            logger.debug(f"Skipping duplicate peer {public_key[:20]}... on {interface}")
+                            continue
+                        seen_pubkeys.add(public_key)
                         
                         # Get allowed IPs for this peer
                         allowed_result = wg.run_wg_command(['show', interface, 'allowed-ips'])
@@ -221,7 +228,7 @@ async def startup_event():
                     logger.warning(f"Error scanning {interface}: {e}")
             
             if recovered_from_wg > 0:
-                logger.info(f"Recovered {recovered_from_wg} peers from WireGuard and broadcast to mesh")
+                logger.info(f"Recovered {recovered_from_wg} unique peers from WireGuard and broadcast to mesh")
         except Exception as e:
             logger.error(f"WireGuard fallback recovery error: {e}")
     
