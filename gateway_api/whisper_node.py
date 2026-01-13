@@ -1043,6 +1043,48 @@ async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(g
     return {"status": "not_found", "message": "Blob not found"}
 
 
+# Purge entire identity (for orphaned blob cleanup)
+class PurgeIdentityRequest(BaseModel):
+    identity_hash: str  # First 16 chars of identity pubkey hash
+
+@app.post("/whisper/purge-identity")
+async def purge_identity_by_hash(request: PurgeIdentityRequest, s: WhisperState = Depends(get_state)):
+    """Purge all blobs for an identity by its hash (for orphaned blob cleanup)"""
+    global peer_recovery_store, recovery_events
+    
+    target_hash = request.identity_hash
+    
+    # Find matching identity by hash
+    found_identity = None
+    for identity in list(peer_recovery_store.keys()):
+        identity_hash = hashlib.sha256(identity.encode()).hexdigest()[:16]
+        if identity_hash == target_hash:
+            found_identity = identity
+            break
+    
+    if not found_identity:
+        return {"status": "not_found", "message": f"No identity matching hash {target_hash}"}
+    
+    blob_count = len(peer_recovery_store[found_identity].get("blobs", []))
+    del peer_recovery_store[found_identity]
+    
+    recovery_events.append({
+        "type": "IDENTITY_PURGED",
+        "identity_hash": target_hash,
+        "blobs_removed": blob_count,
+        "reason": "orphan_cleanup",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+    
+    logger.info(f"Purged orphaned identity {target_hash} ({blob_count} blobs)")
+    
+    return {
+        "status": "purged",
+        "identity_hash": target_hash,
+        "blobs_removed": blob_count
+    }
+
+
 @app.patch("/whisper/peer-data/status")
 async def update_blob_status(request: StatusUpdateRequest, s: WhisperState = Depends(get_state)):
     """
