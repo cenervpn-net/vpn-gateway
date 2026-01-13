@@ -55,3 +55,4 @@ deployment-vars.yaml
 gateway-*.yaml
 credentials.enc
 
+push.sh
