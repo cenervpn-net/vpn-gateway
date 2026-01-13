@@ -145,6 +145,86 @@ async def startup_event():
         logger.warning("Mesh sync not available - starting with empty peer store")
         peer_store.initialize()
     
+    # FALLBACK: If peer_store is empty but WireGuard has peers, scan and rebuild
+    if len(peer_store.get_all()) == 0:
+        logger.info("Peer store is empty - scanning WireGuard for existing peers...")
+        try:
+            from mesh_peer_sync import on_peer_created
+            import asyncio
+            
+            interface_obf_map = {'wg0': 'off', 'wg1': 'basic', 'wg2': 'high', 'wg3': 'stealth'}
+            recovered_from_wg = 0
+            
+            for interface in ['wg0', 'wg1', 'wg2', 'wg3']:
+                try:
+                    result = wg.run_wg_command(['show', interface, 'peers'])
+                    if result.returncode != 0 or not result.stdout.strip():
+                        continue
+                    
+                    for public_key in result.stdout.strip().split('\n'):
+                        if not public_key:
+                            continue
+                        
+                        # Get allowed IPs for this peer
+                        allowed_result = wg.run_wg_command(['show', interface, 'allowed-ips'])
+                        assigned_ip = ""
+                        if allowed_result.returncode == 0:
+                            for line in allowed_result.stdout.strip().split('\n'):
+                                if public_key in line:
+                                    parts = line.split('\t')
+                                    if len(parts) >= 2:
+                                        ip_part = parts[1].strip().split('/')[0]
+                                        if ip_part and ip_part != '(none)':
+                                            assigned_ip = ip_part
+                                    break
+                        
+                        obf_level = interface_obf_map.get(interface, 'off')
+                        
+                        # Create minimal peer config
+                        config = PeerConfig(
+                            public_key=public_key,
+                            status="active",
+                            assigned_ip=assigned_ip,
+                            assigned_ipv6="",
+                            assigned_port=0,
+                            tunnel_traffic="all",
+                            dns_choice="",
+                            allowed_ips=f"{assigned_ip}/32" if assigned_ip else "",
+                            obfuscation_level=obf_level,
+                            obfuscation_enabled=(obf_level != 'off'),
+                        )
+                        
+                        peer_store.add(config)
+                        recovered_from_wg += 1
+                        logger.info(f"Recovered peer from WireGuard: {public_key[:20]}... on {interface}")
+                        
+                        # Broadcast to mesh
+                        if MESH_SYNC_AVAILABLE:
+                            peer_config_for_mesh = {
+                                "public_key": public_key,
+                                "assigned_ip": assigned_ip,
+                                "assigned_ipv6": "",
+                                "assigned_port": 0,
+                                "tunnel_traffic": "all",
+                                "dns_choice": "",
+                                "allowed_ips": f"{assigned_ip}/32" if assigned_ip else "",
+                                "obfuscation_level": obf_level,
+                                "status": "active",
+                            }
+                            try:
+                                await on_peer_created(peer_config_for_mesh)
+                                logger.debug(f"Broadcast recovered peer to mesh: {public_key[:20]}...")
+                            except Exception as e:
+                                logger.warning(f"Failed to broadcast recovered peer: {e}")
+                
+                except Exception as e:
+                    logger.warning(f"Error scanning {interface}: {e}")
+            
+            if recovered_from_wg > 0:
+                logger.info(f"Recovered {recovered_from_wg} peers from WireGuard and broadcast to mesh")
+        except Exception as e:
+            logger.error(f"WireGuard fallback recovery error: {e}")
+    
     # NOTE: In RAM-only mode, we skip sync_and_reconstruct_peers() because:
     # 1. We already added recovered peers to WireGuard above
     # 2. sync_and_reconstruct_peers() would remove them and try to read from SQLite (which doesn't exist)
