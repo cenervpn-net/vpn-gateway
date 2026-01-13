@@ -128,7 +128,7 @@ class PeerRecoveryCrypto:
         crypto.derive_identity(wg_private_keys)
         
         # Encrypt and broadcast
-        blob, wrapped_keys = crypto.encrypt_peer_config(peer_config, mesh_peers)
+        blob, wrapped_keys = crypto.encrypt_peer_config(peer_config, mesh_nodes)
         
         # Recovery
         request = crypto.create_recovery_request()
@@ -515,39 +515,20 @@ def load_wg_private_keys() -> List[str]:
         List of base64-encoded private keys [wg0, wg1, wg2, wg3]
     """
     keys = []
+    wg_config_dir = Path("/etc/wireguard")
     
-    # Try multiple locations (standard WireGuard and AmneziaWG)
-    config_dirs = [
-        Path("/etc/amnezia/amneziawg"),  # AmneziaWG location
-        Path("/etc/wireguard"),           # Standard WireGuard location
-    ]
-    
-    for wg_config_dir in config_dirs:
-        if not wg_config_dir.exists():
-            continue
-            
-        for iface in ["wg0", "wg1", "wg2", "wg3"]:
-            config_path = wg_config_dir / f"{iface}.conf"
-            if config_path.exists():
-                try:
-                    content = config_path.read_text()
-                    for line in content.split('\n'):
-                        if line.strip().startswith('PrivateKey'):
-                            key = line.split('=', 1)[1].strip()
-                            keys.append(key)
-                            logger.debug(f"Loaded private key from {config_path}")
-                            break
-                except PermissionError:
-                    logger.warning(f"Permission denied reading {config_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to read {iface} private key: {e}")
-        
-        # If we found keys in this directory, don't check others
-        if keys:
-            break
-    
-    if not keys:
-        logger.warning("No WG private keys found in any config directory")
+    for iface in ["wg0", "wg1", "wg2", "wg3"]:
+        config_path = wg_config_dir / f"{iface}.conf"
+        if config_path.exists():
+            try:
+                content = config_path.read_text()
+                for line in content.split('\n'):
+                    if line.strip().startswith('PrivateKey'):
+                        key = line.split('=')[1].strip()
+                        keys.append(key)
+                        break
+            except Exception as e:
+                logger.warning(f"Failed to read {iface} private key: {e}")
     
     return keys
 

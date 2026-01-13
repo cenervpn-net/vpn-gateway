@@ -42,8 +42,8 @@ from peer_recovery_crypto import (
 
 logger = logging.getLogger("mesh_peer_sync")
 
-# Configuration
-DEFAULT_WHISPER_PORT = 8100  # Default port for gateway mesh peers
+        # Configuration
+DEFAULT_WHISPER_PORT = 8100  # Default port for gateway mesh nodes
 QUORUM_SIZE = 2  # Minimum peers that must agree
 MAX_RECOVERY_PEERS = 5  # Max peers to query for recovery
 RECOVERY_TIMEOUT = 30  # Seconds
@@ -109,10 +109,10 @@ class MeshPeerSync:
         self.ca_path = ca_path or os.environ.get("WHISPER_CA", "/home/ubuntu/wg-manager/gateway_api/ca.crt")
         
         # Data directory for tracking
-        self.data_dir = Path(os.environ.get("WHISPER_DATA", "/dev/shm/whisper_data"))
+        self.data_dir = Path(os.environ.get("WHISPER_DATA", "/home/ubuntu/wg-manager/whisper_data"))
         
-        # Peer list (loaded from whisper state)
-        self._mesh_peers: Dict[str, dict] = {}  # ip -> {pubkey, name, ...}
+        # Mesh nodes list (gateways + backends for recovery network)
+        self._mesh_nodes: Dict[str, dict] = {}  # ip -> {pubkey, name, ...}
         self._config_version = 0
         
     async def initialize(self) -> bool:
@@ -165,21 +165,24 @@ class MeshPeerSync:
         ctx.verify_mode = ssl.CERT_REQUIRED
         return ctx
     
-    async def _get_mesh_peers(self) -> Dict[str, dict]:
+    async def _get_mesh_nodes(self) -> Dict[str, dict]:
         """
-        Get list of mesh peers with their public keys.
+        Get list of mesh nodes (gateways + backends) with their public keys.
         
         Returns:
             Dict mapping IP -> {pubkey, name}
         """
-        # Try to load from whisper state file
-        peers_file = self.data_dir / "mesh_peers.json"
-        if peers_file.exists():
+        # Try to load from mesh nodes config file
+        nodes_file = self.data_dir / "mesh_nodes.json"
+        # Legacy fallback
+        if not nodes_file.exists():
+            nodes_file = self.data_dir / "mesh_peers.json"
+        if nodes_file.exists():
             try:
-                with open(peers_file) as f:
-                    self._mesh_peers = json.load(f)
+                with open(nodes_file) as f:
+                    self._mesh_nodes = json.load(f)
             except Exception as e:
-                logger.warning(f"Failed to load mesh peers: {e}")
+                logger.warning(f"Failed to load mesh nodes: {e}")
         
         # Also try to get from local whisper node
         try:
@@ -190,7 +193,7 @@ class MeshPeerSync:
                     for peer in data.get("known_peers", []):
                         ip = peer.get("ip", peer.get("mgmt_ip"))
                         if ip:
-                            self._mesh_peers[ip] = {
+                            self._mesh_nodes[ip] = {
                                 "name": peer.get("name", peer.get("gateway_name")),
                                 "pubkey": peer.get("identity_pubkey", ""),  # May not have yet
                                 "status": peer.get("status", "unknown")
@@ -198,19 +201,19 @@ class MeshPeerSync:
         except Exception as e:
             logger.debug(f"Could not get peers from local whisper: {e}")
         
-        return self._mesh_peers
+        return self._mesh_nodes
     
     async def broadcast_peer_config(
         self,
         peer_config: dict,
-        mesh_peers: Dict[str, str] = None
+        mesh_nodes: Dict[str, str] = None
     ) -> Tuple[int, int]:
         """
-        Broadcast an encrypted peer config to all mesh peers.
+        Broadcast an encrypted peer config to all mesh nodes.
         
         Args:
             peer_config: The peer configuration dict
-            mesh_peers: Optional dict of peer_ip -> identity_pubkey
+            mesh_nodes: Optional dict of node_ip -> identity_pubkey
         
         Returns:
             Tuple of (success_count, total_count)
@@ -218,23 +221,20 @@ class MeshPeerSync:
         if not self.identity:
             raise RuntimeError("Mesh sync not initialized")
         
-        # Get mesh peers if not provided
-        if not mesh_peers:
-            await self._get_mesh_peers()
-            # Include gateway peers with pubkeys AND backend peers (no pubkey required)
-            mesh_peers = {}
-            for ip, info in self._mesh_peers.items():
+        # Get mesh nodes if not provided
+        if not mesh_nodes:
+            await self._get_mesh_nodes()
+            # Include gateway nodes with pubkeys AND backend nodes (no pubkey required)
+            mesh_nodes = {}
+            for ip, info in self._mesh_nodes.items():
                 if info.get("type") == "backend":
                     # Backend nodes use a placeholder identity (they store blobs as-is)
-                    mesh_peers[ip] = info.get("name", f"backend-{ip}")
+                    mesh_nodes[ip] = info.get("name", f"backend-{ip}")
                 elif info.get("pubkey"):
-                    mesh_peers[ip] = info.get("pubkey")
-            
-            # Note: For self-recovery via backend nodes, the sender's wrapped_key
-            # is included in the blob by the crypto layer during encryption
+                    mesh_nodes[ip] = info.get("pubkey")
         
-        if not mesh_peers:
-            logger.warning("No mesh peers configured - skipping broadcast")
+        if not mesh_nodes:
+            logger.warning("No mesh nodes configured - skipping broadcast")
             return 0, 0
         
         # Increment version
@@ -244,13 +244,13 @@ class MeshPeerSync:
         # Encrypt peer config
         blob, wrapped_keys = self.crypto.encrypt_peer_config(
             peer_config,
-            mesh_peers,
+            mesh_nodes,
             version=self._config_version
         )
         
-        # Broadcast to all peers
+        # Broadcast to all nodes
         success_count = 0
-        total_count = len(mesh_peers)
+        total_count = len(mesh_nodes)
         
         # Generate peer_id for status lookups (hash of public_key)
         peer_public_key = peer_config.get("public_key", "")
@@ -264,21 +264,18 @@ class MeshPeerSync:
                 ip, port = parse_peer_address(addr)
                 
                 # Check if this is a backend node (stores blobs as-is, no decryption)
-                is_backend = self._mesh_peers.get(addr, {}).get("type") == "backend"
+                is_backend = self._mesh_nodes.get(addr, {}).get("type") == "backend"
                 
                 if is_backend:
-                    # Backend nodes store blobs for recovery - include sender's wrapped key
-                    # so the sender can recover their own blobs later
-                    my_pubkey = self.identity.public_key_b64()
-                    my_wrapped_key = wrapped_keys.get(my_pubkey)
+                    # Backend nodes store blobs without decryption - use placeholder wrapped_key
                     payload = {
-                        "identity_pubkey": my_pubkey,
+                        "identity_pubkey": self.identity.public_key_b64(),
                         "blob_hash": blob.blob_hash,
                         "encrypted_blob": blob.encrypted_data,
                         "blob_nonce": blob.nonce,
                         "version": blob.version,
-                        "wrapped_key": my_wrapped_key.wrapped_key if my_wrapped_key else "",
-                        "wrapped_key_nonce": my_wrapped_key.nonce if my_wrapped_key else "",
+                        "wrapped_key": "",  # Backend doesn't need this
+                        "wrapped_key_nonce": "",
                         "timestamp": blob.timestamp,
                         "signature": "",
                         "peer_id": config_peer_id  # For status lookups
@@ -286,7 +283,7 @@ class MeshPeerSync:
                 else:
                     # Gateway nodes need wrapped keys for decryption
                     if mesh_peer_id not in wrapped_keys:
-                        logger.warning(f"No wrapped key for peer {mesh_peer_id}")
+                        logger.warning(f"No wrapped key for node {mesh_peer_id}")
                         return
                     
                     wk = wrapped_keys[mesh_peer_id]
@@ -321,10 +318,10 @@ class MeshPeerSync:
                 logger.warning(f"Failed to broadcast to {addr}: {e}")
         
         # Send in parallel
-        tasks = [send_to_peer(ip, ip) for ip in mesh_peers.keys()]
+        tasks = [send_to_peer(ip, ip) for ip in mesh_nodes.keys()]
         await asyncio.gather(*tasks)
         
-        logger.info(f"Broadcast peer config v{self._config_version} to {success_count}/{total_count} peers")
+        logger.info(f"Broadcast peer config v{self._config_version} to {success_count}/{total_count} mesh nodes")
         return success_count, total_count
     
     async def recover_peer_configs(self, require_quorum: bool = True) -> RecoveryResult:
@@ -343,13 +340,13 @@ class MeshPeerSync:
         if not self.identity:
             raise RuntimeError("Mesh sync not initialized")
         
-        # Get mesh peers
-        await self._get_mesh_peers()
-        # Include backend mesh nodes (status: "persistent") and gateway peers
-        alive_peers = [addr for addr, info in self._mesh_peers.items() 
+        # Get mesh nodes
+        await self._get_mesh_nodes()
+        # Include backend mesh nodes (status: "persistent") and gateway nodes
+        alive_nodes = [addr for addr, info in self._mesh_nodes.items() 
                        if info.get("status") in ("alive", "unknown", "persistent", None)]
         
-        if len(alive_peers) < QUORUM_SIZE and require_quorum:
+        if len(alive_nodes) < QUORUM_SIZE and require_quorum:
             return RecoveryResult(
                 success=False,
                 recovered_configs=[],
@@ -359,10 +356,10 @@ class MeshPeerSync:
                     disagreeing_peers=[],
                     consensus_hash=None,
                     total_queried=0,
-                    errors=[f"Not enough peers ({len(alive_peers)} < {QUORUM_SIZE})"]
+                    errors=[f"Not enough nodes ({len(alive_nodes)} < {QUORUM_SIZE})"]
                 ),
                 identity_pubkey=self.identity.public_key_b64(),
-                message="Not enough mesh peers for quorum"
+                message="Not enough mesh nodes for quorum"
             )
         
         # Create signed recovery request
@@ -377,7 +374,7 @@ class MeshPeerSync:
         async def query_peer(addr: str):
             try:
                 ip, port = parse_peer_address(addr)
-                is_backend = self._mesh_peers.get(addr, {}).get("type") == "backend"
+                is_backend = self._mesh_nodes.get(addr, {}).get("type") == "backend"
                 protocol = "http" if is_backend else "https"
                 client_ctx = None if is_backend else ssl_ctx
                 
@@ -394,7 +391,7 @@ class MeshPeerSync:
                 errors.append(f"{addr}: {str(e)}")
         
         # Query up to MAX_RECOVERY_PEERS
-        peers_to_query = alive_peers[:MAX_RECOVERY_PEERS]
+        peers_to_query = alive_nodes[:MAX_RECOVERY_PEERS]
         tasks = [query_peer(ip) for ip in peers_to_query]
         await asyncio.gather(*tasks)
         
@@ -501,16 +498,9 @@ class MeshPeerSync:
         if not wrapped_key:
             raise ValueError("No wrapped key provided")
         
-        # Get peer's public key for ECDH
-        peer_info = self._mesh_peers.get(peer_ip, {})
-        is_backend = peer_info.get("type") == "backend"
-        
-        if is_backend:
-            # Backend nodes store our wrapped key for ourselves
-            # Use our own public key for decryption
-            peer_pubkey = self.identity.public_key_b64()
-        else:
-            peer_pubkey = peer_info.get("pubkey")
+        # Get node's public key for ECDH
+        peer_info = self._mesh_nodes.get(peer_ip, {})
+        peer_pubkey = peer_info.get("pubkey")
         
         if not peer_pubkey:
             raise ValueError(f"No public key for peer {peer_ip}")
@@ -528,18 +518,10 @@ class MeshPeerSync:
                     owner_identity=self.identity.public_key_b64()
                 )
                 
-                # Use per-blob wrapped key if available, otherwise fall back to identity-level
-                blob_wrapped_key = blob_dict.get("wrapped_key") or wrapped_key
-                blob_wrapped_key_nonce = blob_dict.get("wrapped_key_nonce") or wrapped_key_nonce
-                
-                if not blob_wrapped_key:
-                    logger.warning(f"No wrapped key for blob {blob_dict.get('blob_hash', 'unknown')[:8]}")
-                    continue
-                
                 wk = WrappedKeyBundle(
                     peer_pubkey_hash="",  # Not needed for decryption
-                    wrapped_key=blob_wrapped_key,
-                    nonce=blob_wrapped_key_nonce
+                    wrapped_key=wrapped_key,
+                    nonce=wrapped_key_nonce
                 )
                 
                 config = self.crypto.decrypt_peer_config(blob, wk, peer_pubkey)
@@ -571,14 +553,13 @@ class MeshPeerSync:
         if not self.identity:
             raise RuntimeError("Mesh sync not initialized")
         
-        await self._get_mesh_peers()
+        await self._get_mesh_nodes()
         
-        # Use peer_id for reliable lookup (hash of public_key only)
-        # This matches how blobs are stored with peer_id field
-        peer_id = hash_peer_config({"public_key": peer_public_key})
+        # Hash the peer config to identify the blob
+        blob_hash = hash_peer_config({"public_key": peer_public_key})
         
         success_count = 0
-        total_count = len(self._mesh_peers)
+        total_count = len(self._mesh_nodes)
         
         ssl_ctx = self._get_ssl_context()
         
@@ -586,13 +567,13 @@ class MeshPeerSync:
             nonlocal success_count
             try:
                 ip, port = parse_peer_address(addr)
-                is_backend = self._mesh_peers.get(addr, {}).get("type") == "backend"
+                is_backend = self._mesh_nodes.get(addr, {}).get("type") == "backend"
                 protocol = "http" if is_backend else "https"
                 client_ctx = None if is_backend else ssl_ctx
                 
                 payload = {
                     "identity_pubkey": self.identity.public_key_b64(),
-                    "peer_id": peer_id,  # Use peer_id for reliable lookup
+                    "blob_hash": blob_hash,
                     "peer_public_key": peer_public_key,
                     "reason": "peer_deleted",
                     "timestamp": datetime.now(timezone.utc).isoformat()
@@ -604,21 +585,17 @@ class MeshPeerSync:
                         json=payload
                     )
                     if resp.status_code == 200:
-                        result = resp.json()
-                        if result.get("status") == "purged":
-                            success_count += 1
-                            logger.debug(f"Purged peer blob from {addr}")
-                        else:
-                            logger.debug(f"Blob not found on {addr}")
+                        success_count += 1
+                        logger.debug(f"Purged peer blob from {addr}")
                     else:
                         logger.warning(f"Failed to purge from {addr}: HTTP {resp.status_code}")
             except Exception as e:
                 logger.warning(f"Failed to purge from {addr}: {e}")
         
-        tasks = [purge_from_peer(ip) for ip in self._mesh_peers.keys()]
+        tasks = [purge_from_peer(ip) for ip in self._mesh_nodes.keys()]
         await asyncio.gather(*tasks)
         
-        logger.info(f"Purged peer blob (peer_id: {peer_id[:8]}...) from {success_count}/{total_count} mesh peers")
+        logger.info(f"Purged peer blob {blob_hash[:8]}... from {success_count}/{total_count} mesh peers")
         return success_count, total_count
 
     async def purge_data_from_mesh(self, reason: str = "wipe") -> Tuple[int, int]:
@@ -634,10 +611,10 @@ class MeshPeerSync:
         if not self.identity:
             raise RuntimeError("Mesh sync not initialized")
         
-        await self._get_mesh_peers()
+        await self._get_mesh_nodes()
         
         success_count = 0
-        total_count = len(self._mesh_peers)
+        total_count = len(self._mesh_nodes)
         
         ssl_ctx = self._get_ssl_context()
         
@@ -645,7 +622,7 @@ class MeshPeerSync:
             nonlocal success_count
             try:
                 ip, port = parse_peer_address(addr)
-                is_backend = self._mesh_peers.get(addr, {}).get("type") == "backend"
+                is_backend = self._mesh_nodes.get(addr, {}).get("type") == "backend"
                 protocol = "http" if is_backend else "https"
                 client_ctx = None if is_backend else ssl_ctx
                 
@@ -667,7 +644,7 @@ class MeshPeerSync:
             except Exception as e:
                 logger.warning(f"Failed to purge from {addr}: {e}")
         
-        tasks = [purge_from_peer_all(addr) for addr in self._mesh_peers.keys()]
+        tasks = [purge_from_peer_all(addr) for addr in self._mesh_nodes.keys()]
         await asyncio.gather(*tasks)
         
         logger.info(f"Purged data from {success_count}/{total_count} mesh peers")
@@ -695,13 +672,13 @@ class MeshPeerSync:
         if not self.identity:
             raise RuntimeError("Mesh sync not initialized")
         
-        await self._get_mesh_peers()
+        await self._get_mesh_nodes()
         
         # Hash the peer config to get peer_id for status lookups
         peer_id = hash_peer_config({"public_key": peer_public_key})
         
         success_count = 0
-        total_count = len(self._mesh_peers)
+        total_count = len(self._mesh_nodes)
         
         ssl_ctx = self._get_ssl_context()
         
@@ -709,7 +686,7 @@ class MeshPeerSync:
             nonlocal success_count
             try:
                 ip, port = parse_peer_address(addr)
-                is_backend = self._mesh_peers.get(addr, {}).get("type") == "backend"
+                is_backend = self._mesh_nodes.get(addr, {}).get("type") == "backend"
                 protocol = "http" if is_backend else "https"
                 client_ctx = None if is_backend else ssl_ctx
                 
@@ -733,7 +710,7 @@ class MeshPeerSync:
             except Exception as e:
                 logger.warning(f"Failed to update status on {addr}: {e}")
         
-        tasks = [update_on_peer(addr) for addr in self._mesh_peers.keys()]
+        tasks = [update_on_peer(addr) for addr in self._mesh_nodes.keys()]
         await asyncio.gather(*tasks)
         
         logger.info(f"Updated peer {peer_public_key[:16]}... status to '{new_status}' on {success_count}/{total_count} mesh peers")
@@ -759,7 +736,7 @@ class MeshPeerSync:
         if not self.identity:
             raise RuntimeError("Mesh sync not initialized")
         
-        await self._get_mesh_peers()
+        await self._get_mesh_nodes()
         
         blob_hash = ""
         if peer_public_key:
@@ -771,7 +748,7 @@ class MeshPeerSync:
         async def query_peer(addr: str):
             try:
                 ip, port = parse_peer_address(addr)
-                is_backend = self._mesh_peers.get(addr, {}).get("type") == "backend"
+                is_backend = self._mesh_nodes.get(addr, {}).get("type") == "backend"
                 protocol = "http" if is_backend else "https"
                 client_ctx = None if is_backend else ssl_ctx
                 
@@ -800,7 +777,7 @@ class MeshPeerSync:
                 logger.debug(f"Query to {addr} failed: {e}")
             return None
         
-        tasks = [query_peer(addr) for addr in self._mesh_peers.keys()]
+        tasks = [query_peer(addr) for addr in self._mesh_nodes.keys()]
         responses = await asyncio.gather(*tasks)
         
         results = [r for r in responses if r is not None]
@@ -925,4 +902,157 @@ async def recover_peers() -> RecoveryResult:
     """Called during reprovisioning to recover peer configs"""
     sync = await get_mesh_sync()
     return await sync.recover_peer_configs()
+
+
+def get_own_identity_pubkey() -> str:
+    """
+    Get this gateway's own identity pubkey (sync version).
+    Used to identify which blobs belong to this gateway.
+    """
+    try:
+        from peer_recovery_crypto import load_wg_private_keys, PeerRecoveryCrypto
+        wg_keys = load_wg_private_keys()
+        if not wg_keys:
+            return ""
+        crypto = PeerRecoveryCrypto()
+        identity = crypto.derive_identity(wg_keys)
+        return identity.public_key_b64()
+    except Exception as e:
+        logger.warning(f"Failed to get own identity pubkey: {e}")
+        return ""
+
+
+async def sync_from_mesh(target_store: dict = None) -> dict:
+    """
+    Sync ALL blobs from mesh nodes into local peer_recovery_store.
+    Called on startup to repopulate in-memory store from other mesh nodes.
+    
+    This is different from recover_peers() which recovers OUR OWN peer configs.
+    This syncs ALL blobs so we can serve other gateways' recovery requests.
+    
+    Args:
+        target_store: The peer_recovery_store dict to store blobs into.
+                     If None, imports from whisper_node (for standalone testing).
+    """
+    import aiohttp
+    import socket
+    from datetime import datetime, timezone
+    
+    results = {
+        "synced_identities": 0,
+        "synced_blobs": 0,
+        "sources_queried": 0,
+        "errors": []
+    }
+    
+    # Get gateway name for request
+    gateway_name = os.environ.get("GATEWAY_NAME", socket.gethostname())
+    
+    # Query backend mesh nodes (most reliable - they persist data)
+    backend_nodes = [
+        "http://10.100.0.1:8101",
+        "http://10.100.0.1:8102"
+    ]
+    
+    # We only query backend nodes on startup since they have persistent storage
+    # Other gateways also have in-memory stores that may be empty
+    all_nodes = backend_nodes
+    
+    async def fetch_from_node(base_url: str) -> dict:
+        """Fetch all blobs from a mesh node"""
+        try:
+            # Use mesh/sync endpoint to get all blobs
+            connector = aiohttp.TCPConnector(ssl=False) if base_url.startswith("http://") else aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.post(
+                    f"{base_url}/whisper/mesh/sync",
+                    json={
+                        "requester_pubkey": "startup-sync",
+                        "requester_name": gateway_name,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "nonce": os.urandom(16).hex()
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    else:
+                        logger.warning(f"Mesh sync from {base_url} returned status {resp.status}")
+        except Exception as e:
+            logger.warning(f"Failed to sync from {base_url}: {e}")
+        return None
+    
+    # Fetch from all nodes
+    tasks = [fetch_from_node(url) for url in all_nodes]
+    responses = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Process responses and store blobs locally
+    seen_blobs = set()  # Track unique blobs by hash
+    
+    for i, resp in enumerate(responses):
+        if isinstance(resp, Exception) or resp is None:
+            continue
+        
+        if resp.get("status") != "ok":
+            continue
+            
+        results["sources_queried"] += 1
+        
+        # Response format: {"data": {identity: {blobs: [...], wrapped_key: ...}}}
+        all_data = resp.get("data", {})
+        
+        for identity, identity_data in all_data.items():
+            blobs = identity_data.get("blobs", [])
+            wrapped_key = identity_data.get("wrapped_key", "")
+            wrapped_key_nonce = identity_data.get("wrapped_key_nonce", "")
+            stored_at = identity_data.get("stored_at", "")
+            
+            for blob_data in blobs:
+                blob_hash = blob_data.get("blob_hash")
+                
+                if not blob_hash:
+                    continue
+                
+                # Skip if we already have this blob
+                if blob_hash in seen_blobs:
+                    continue
+                seen_blobs.add(blob_hash)
+                
+                # Store locally
+                try:
+                    # Use provided store or import from whisper_node
+                    if target_store is None:
+                        from whisper_node import peer_recovery_store
+                        store = peer_recovery_store
+                    else:
+                        store = target_store
+                    
+                    if identity not in store:
+                        store[identity] = {
+                            "blobs": [],
+                            "wrapped_key": wrapped_key,
+                            "wrapped_key_nonce": wrapped_key_nonce,
+                            "stored_at": stored_at or datetime.now(timezone.utc).isoformat()
+                        }
+                        results["synced_identities"] += 1
+                    
+                    # Check if blob already exists
+                    existing_hashes = [b.get("blob_hash") for b in store[identity]["blobs"]]
+                    if blob_hash not in existing_hashes:
+                        store[identity]["blobs"].append({
+                            "blob_hash": blob_hash,
+                            "encrypted_blob": blob_data.get("encrypted_blob", ""),
+                            "blob_nonce": blob_data.get("blob_nonce", ""),
+                            "version": blob_data.get("version", 1),
+                            "timestamp": blob_data.get("timestamp", ""),
+                            "status": blob_data.get("status", "active"),
+                            "peer_id": blob_data.get("peer_id", "")
+                        })
+                        results["synced_blobs"] += 1
+                        
+                except Exception as e:
+                    results["errors"].append(f"Failed to store blob {blob_hash[:8]}: {str(e)}")
+    
+    logger.info(f"Mesh sync complete: {results['synced_blobs']} blobs from {results['sources_queried']} sources")
+    return results
 

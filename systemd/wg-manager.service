@@ -6,6 +6,9 @@ Requires=awg-quick@wg0.service awg-quick@wg1.service awg-quick@wg2.service awg-q
 [Service]
 User=ubuntu
 WorkingDirectory=/home/ubuntu/wg-manager/gateway_api
+EnvironmentFile=/home/ubuntu/wg-manager/.env
+# Use persistent whisper_data directory - RAM path was unreliable
+Environment=WHISPER_DATA=/home/ubuntu/wg-manager/whisper_data
 ExecStart=/home/ubuntu/wg-manager/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --ssl-keyfile key.pem --ssl-certfile cert.pem
 Environment="PATH=/home/ubuntu/wg-manager/venv/bin"
 Restart=always

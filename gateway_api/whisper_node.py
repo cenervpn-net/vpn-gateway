@@ -215,14 +215,60 @@ state: Optional[WhisperState] = None
 
 
 # =============================================================================
+# =============================================================================
+# Version Information
+# =============================================================================
+
+# Software version - read from environment (set by deployment/provisioning)
+SOFTWARE_VERSION = os.environ.get("WG_MANAGER_VERSION", "1.0.0")
+WG_MANAGER_VERSION = os.environ.get("WG_MANAGER_VERSION", "1.0.0")
+GATEWAY_API_VERSION = os.environ.get("GATEWAY_API_VERSION", "1.0.0")
+
+# Build info (injected during deployment)
+BUILD_DATE = os.environ.get("BUILD_DATE", "unknown")
+BUILD_COMMIT = os.environ.get("BUILD_COMMIT", "unknown")
+BUILD_INFO = os.environ.get("BUILD_INFO", "unknown")
+
+# =============================================================================
 # FastAPI Application
 # =============================================================================
 
 app = FastAPI(
     title="Whisper Node",
     description="Gateway-to-Gateway Communication Service",
-    version="1.0.0"
+    version=SOFTWARE_VERSION
 )
+
+
+@app.on_event("startup")
+async def startup_mesh_sync():
+    """
+    On startup, sync blobs from other mesh nodes to repopulate in-memory store.
+    This ensures we can serve recovery requests for other gateways immediately.
+    """
+    global state, peer_recovery_store, recovery_events
+    
+    # Wait a bit for state to be initialized
+    import asyncio
+    for _ in range(10):  # Wait up to 10 seconds
+        if state is not None:
+            break
+        await asyncio.sleep(1)
+    
+    if state is None:
+        logger.warning("Startup sync skipped: state not initialized")
+        return
+    
+    try:
+        # Import here to avoid circular dependency at module load time
+        from mesh_peer_sync import sync_from_mesh
+        
+        logger.info("Starting mesh sync on startup...")
+        # Pass our local store reference so sync stores to the correct place
+        result = await sync_from_mesh(peer_recovery_store)
+        logger.info(f"Startup mesh sync complete: {result.get('synced_blobs', 0)} blobs synced")
+    except Exception as e:
+        logger.error(f"Startup mesh sync failed: {e}")
 
 
 def get_state() -> WhisperState:
@@ -260,7 +306,15 @@ async def get_status(s: WhisperState = Depends(get_state)):
         "revoked_serials": list(s.crl_entries.keys()),  # For admin visibility
         "known_peers": len(s.known_peers),
         "alive_peers": len(s.get_alive_peers()),
-        "quorum_size": QUORUM_SIZE
+        "quorum_size": QUORUM_SIZE,
+        # Version information
+        "whisper_version": SOFTWARE_VERSION,
+        "software_version": SOFTWARE_VERSION,
+        "wg_manager_version": WG_MANAGER_VERSION,
+        "gateway_api_version": GATEWAY_API_VERSION,
+        "build_date": BUILD_DATE,
+        "build_commit": BUILD_COMMIT,
+        "build_info": BUILD_INFO,
     }
 
 
@@ -538,10 +592,16 @@ def send_heartbeat_to_peer(peer_ip: str, our_state: WhisperState) -> bool:
             }
         }
         
+        # Use mTLS with client certificate for gateway-to-gateway auth
+        cert_tuple = None
+        if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH):
+            cert_tuple = (CERT_PATH, KEY_PATH)
+        
         response = requests.post(
             f"https://{peer_ip}:{WHISPER_PORT}/whisper",
             json=msg,
             timeout=5,
+            cert=cert_tuple,
             verify=CA_CERT_PATH if os.path.exists(CA_CERT_PATH) else False
         )
         
@@ -564,6 +624,11 @@ def broadcast_suspect_to_peers(suspect_name: str, suspect_ip: str, last_seen: st
         "timestamp": datetime.utcnow().isoformat()
     }
     
+    # Use mTLS with client certificate for gateway-to-gateway auth
+    cert_tuple = None
+    if os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH):
+        cert_tuple = (CERT_PATH, KEY_PATH)
+    
     for peer_name, peer_info in our_state.known_peers.items():
         if peer_name == suspect_name or peer_name == our_state.gateway_name:
             continue
@@ -573,6 +638,7 @@ def broadcast_suspect_to_peers(suspect_name: str, suspect_ip: str, last_seen: st
                 f"https://{peer_info.mgmt_ip}:{WHISPER_PORT}/whisper/suspect-report",
                 json=report,
                 timeout=5,
+                cert=cert_tuple,
                 verify=CA_CERT_PATH if os.path.exists(CA_CERT_PATH) else False
             )
             if response.status_code == 200:
@@ -696,7 +762,8 @@ class SecurePeerData(BaseModel):
     wrapped_key: str              # Base64 wrapped master key (for this peer)
     wrapped_key_nonce: str        # Base64 nonce for key unwrapping
     timestamp: str                # ISO timestamp
-    signature: str                # Signature proving identity ownership
+    signature: str = ""           # Signature proving identity ownership (optional for mesh sync)
+    backend_signature: str = ""   # Alternative signature from backend
     peer_id: str = ""             # Hash of peer public key for status lookups
 
 
@@ -1070,26 +1137,214 @@ async def get_peer_data_stats(s: WhisperState = Depends(get_state)):
     """
     Get statistics about stored peer data (for monitoring).
     
-    Returns counts only - no sensitive data.
+    Returns:
+    - Total stats: all blobs stored on this node (mesh replication)
+    - Own stats: only blobs belonging to THIS gateway's identity
     """
     global peer_recovery_store, recovery_events
+    
+    # Get this gateway's own identity pubkey
+    try:
+        from mesh_peer_sync import get_own_identity_pubkey
+        own_identity = get_own_identity_pubkey()
+    except Exception:
+        own_identity = ""
     
     stats = {
         "total_identities": len(peer_recovery_store),
         "total_blobs": sum(len(d["blobs"]) for d in peer_recovery_store.values()),
+        "by_status": {"active": 0, "suspended": 0, "unknown": 0},
+        # Own stats - only this gateway's blobs
+        "own_identity": own_identity[:16] + "..." if own_identity else "",
+        "own_blobs": 0,
+        "own_by_status": {"active": 0, "suspended": 0, "unknown": 0},
         "recent_events": recovery_events[-20:],  # Last 20 events
         "storage_summary": []
     }
     
     # Summary per identity (hashed for privacy)
     for identity, data in peer_recovery_store.items():
-        stats["storage_summary"].append({
+        is_own = (identity == own_identity)
+        
+        identity_stats = {
             "identity_hash": hashlib.sha256(identity.encode()).hexdigest()[:16],
             "blob_count": len(data["blobs"]),
-            "stored_at": data["stored_at"]
-        })
+            "stored_at": data["stored_at"],
+            "statuses": {},
+            "is_own": is_own
+        }
+        
+        # Count blobs by status
+        for blob in data["blobs"]:
+            status = blob.get("status", "unknown")
+            stats["by_status"][status] = stats["by_status"].get(status, 0) + 1
+            identity_stats["statuses"][status] = identity_stats["statuses"].get(status, 0) + 1
+            
+            # Count own blobs separately
+            if is_own:
+                stats["own_blobs"] += 1
+                stats["own_by_status"][status] = stats["own_by_status"].get(status, 0) + 1
+        
+        stats["storage_summary"].append(identity_stats)
     
     return stats
+
+
+# =============================================================================
+# Mesh Sync Endpoints (for true decentralized mesh)
+# =============================================================================
+
+class MeshSyncRequest(BaseModel):
+    """Request to sync all blobs from this node"""
+    requester_pubkey: str  # Identity of requesting gateway
+    requester_name: str    # Gateway name
+    timestamp: str
+    nonce: str
+
+
+class PeerOwnerRequest(BaseModel):
+    """Request to query who owns a specific peer"""
+    peer_id: str           # Hash of peer public_key
+    peer_public_key: str = ""  # Optional: actual peer public key
+    timestamp: str
+    nonce: str
+
+
+@app.post("/whisper/mesh/sync")
+async def mesh_sync_all_blobs(request: MeshSyncRequest, s: WhisperState = Depends(get_state)):
+    """
+    Return ALL stored blobs for mesh synchronization.
+    
+    Called when a new gateway joins the mesh and needs to become
+    a full participant with all existing peer data.
+    
+    Security:
+    - Must be from a verified mesh member (mTLS)
+    - Returns encrypted blobs (new gateway can store but not decrypt others' data)
+    - Each blob includes owner identity for proper attribution
+    """
+    global peer_recovery_store, recovery_events
+    
+    # Verify timestamp freshness (5 minute window for sync operations)
+    try:
+        from datetime import timezone
+        request_time = datetime.fromisoformat(request.timestamp.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        age = abs((now - request_time).total_seconds())
+        if age > 300:  # 5 minute window for sync
+            logger.warning(f"Mesh sync request too old: {age}s")
+            return {"status": "error", "message": "Request expired"}
+    except Exception as e:
+        return {"status": "error", "message": f"Invalid timestamp: {e}"}
+    
+    # Build response with ALL blobs, grouped by owner identity
+    all_data = {}
+    total_blobs = 0
+    
+    for identity, data in peer_recovery_store.items():
+        all_data[identity] = {
+            "blobs": data["blobs"],
+            "wrapped_key": data["wrapped_key"],
+            "wrapped_key_nonce": data["wrapped_key_nonce"],
+            "stored_at": data["stored_at"]
+        }
+        total_blobs += len(data["blobs"])
+    
+    logger.info(f"Mesh sync to {request.requester_name}: sending {total_blobs} blobs from {len(all_data)} identities")
+    
+    recovery_events.append({
+        "type": "MESH_SYNC_SENT",
+        "requester": request.requester_name,
+        "requester_pubkey_hash": hashlib.sha256(request.requester_pubkey.encode()).hexdigest()[:16],
+        "identities_sent": len(all_data),
+        "blobs_sent": total_blobs,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+    
+    return {
+        "status": "ok",
+        "data": all_data,
+        "total_identities": len(all_data),
+        "total_blobs": total_blobs,
+        "responder": s.gateway_name,
+        "responder_pubkey": os.environ.get("GATEWAY_MESH_PUBKEY", "")
+    }
+
+
+@app.post("/whisper/peer-owner")
+async def query_peer_owner(request: PeerOwnerRequest, s: WhisperState = Depends(get_state)):
+    """
+    Query which gateway owns a specific peer.
+    
+    Searches all stored blobs to find which identity owns the peer_id.
+    Used for decentralized ownership queries with consensus.
+    
+    Returns:
+    - owner_identity: The gateway's mesh pubkey that owns this peer
+    - owner_name: Gateway name (if known from mesh_nodes.json)
+    - found: True if peer exists in our storage
+    """
+    global peer_recovery_store
+    
+    # Verify timestamp freshness
+    try:
+        from datetime import timezone
+        request_time = datetime.fromisoformat(request.timestamp.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        age = abs((now - request_time).total_seconds())
+        if age > 60:
+            return {"status": "error", "message": "Request expired"}
+    except Exception as e:
+        return {"status": "error", "message": f"Invalid timestamp: {e}"}
+    
+    peer_id = request.peer_id
+    
+    # If peer_public_key provided, compute peer_id from it
+    if request.peer_public_key and not peer_id:
+        peer_id = hashlib.sha256(request.peer_public_key.encode()).hexdigest()
+    
+    if not peer_id:
+        return {"status": "error", "message": "peer_id or peer_public_key required"}
+    
+    # Search all identities for this peer_id
+    for identity, data in peer_recovery_store.items():
+        for blob in data.get("blobs", []):
+            if blob.get("peer_id") == peer_id:
+                # Found it! Return the owner identity
+                logger.info(f"Peer owner query: {peer_id[:16]}... owned by {identity[:16]}...")
+                
+                # Try to get owner name from mesh_nodes.json
+                owner_name = "unknown"
+                try:
+                    mesh_file = Path(DATA_DIR) / "mesh_nodes.json"
+                    if not mesh_file.exists():
+                        mesh_file = Path(DATA_DIR) / "mesh_peers.json"
+                    if mesh_file.exists():
+                        with open(mesh_file) as f:
+                            mesh_data = json.load(f)
+                        for addr, info in mesh_data.items():
+                            if info.get("pubkey") == identity:
+                                owner_name = info.get("name", addr)
+                                break
+                except Exception:
+                    pass
+                
+                return {
+                    "status": "found",
+                    "peer_id": peer_id,
+                    "owner_identity": identity,
+                    "owner_name": owner_name,
+                    "blob_status": blob.get("status", "active"),
+                    "responder": s.gateway_name
+                }
+    
+    # Not found
+    return {
+        "status": "not_found",
+        "peer_id": peer_id,
+        "message": "Peer not found in our storage",
+        "responder": s.gateway_name
+    }
 
 
 # Legacy endpoints (deprecated, kept for compatibility)
@@ -1179,7 +1434,7 @@ def save_peers_to_disk(s: WhisperState):
 
 
 def load_peers_from_disk() -> Dict[str, PeerInfo]:
-    """Load known peers from disk, bootstrapping from mesh_peers.json if needed"""
+    """Load known peers from disk, bootstrapping from mesh_nodes.json if needed"""
     peers_file = Path(DATA_DIR) / "peers.json"
     
     # Try loading existing peers first
@@ -1193,14 +1448,17 @@ def load_peers_from_disk() -> Dict[str, PeerInfo]:
         except Exception as e:
             logger.warning(f"Failed to load peers.json: {e}")
     
-    # Bootstrap from mesh_peers.json if no peers found
-    mesh_peers_locations = [
-        Path("/home/ubuntu/wg-manager/whisper_data/mesh_peers.json"),
-        Path("/home/ubuntu/wg-manager/gateway_api/mesh_peers.json"),
-        Path(DATA_DIR) / "mesh_peers.json"
+    # Bootstrap from mesh_nodes.json if no peers found (with legacy fallback)
+    mesh_nodes_locations = [
+        Path("/home/ubuntu/wg-manager/whisper_data/mesh_nodes.json"),
+        Path("/home/ubuntu/wg-manager/whisper_data/mesh_peers.json"),  # legacy fallback
+        Path("/home/ubuntu/wg-manager/gateway_api/mesh_nodes.json"),
+        Path("/home/ubuntu/wg-manager/gateway_api/mesh_peers.json"),   # legacy fallback
+        Path(DATA_DIR) / "mesh_nodes.json",
+        Path(DATA_DIR) / "mesh_peers.json"   # legacy fallback
     ]
     
-    for mesh_file in mesh_peers_locations:
+    for mesh_file in mesh_nodes_locations:
         if mesh_file.exists():
             try:
                 with open(mesh_file) as f:
@@ -1224,7 +1482,7 @@ def load_peers_from_disk() -> Dict[str, PeerInfo]:
                     )
                 
                 if peers:
-                    logger.info(f"Bootstrapped {len(peers)} peers from {mesh_file}")
+                    logger.info(f"Bootstrapped {len(peers)} nodes from {mesh_file}")
                     return peers
             except Exception as e:
                 logger.warning(f"Failed to bootstrap from {mesh_file}: {e}")
