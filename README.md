@@ -1,34 +1,97 @@
-# VPN Gateway API - WireGuard/AmneziaVPN Management
+# VPN Gateway API - WireGuard/AmneziaWG Management
 
-**Secure, high-performance VPN gateway API with HMAC authentication and optional payload encryption.**
-
----
-
-## 🎯 Features
-
-- ✅ WireGuard peer management via REST API
-- ✅ HMAC-SHA256 authentication
-- ✅ AES-256-GCM payload encryption (optional)
-- ✅ Dual-stack IPv4/IPv6 support
-- ✅ Thread-safe IP allocation
-- ✅ Automatic peer reconstruction on startup
-- ✅ Health monitoring endpoints
-- ✅ SQLite database with automatic schema management
-- 🔄 AmneziaVPN obfuscation support (planned)
+**Secure, high-performance VPN gateway with distributed mesh peer recovery, HMAC authentication, and AmneziaWG obfuscation support.**
 
 ---
 
-## 📋 Prerequisites
+## Overview
+
+This gateway API provides enterprise-grade WireGuard peer management with a unique **zero-knowledge mesh recovery system**. Peer configurations are encrypted and distributed across the mesh network, enabling automatic recovery after gateway reprovisioning without the backend ever seeing plaintext peer data.
+
+---
+
+## Key Features
+
+### Core VPN Management
+- WireGuard & AmneziaWG peer management via REST API
+- HMAC-SHA256 request authentication
+- AES-256-GCM payload encryption (optional)
+- Dual-stack IPv4/IPv6 support
+- Thread-safe IP allocation
+- Automatic peer reconstruction on startup
+
+### Mesh Peer Recovery System
+- **Zero-knowledge architecture**: Backend stores only encrypted blobs
+- **Distributed storage**: Peer configs replicated across mesh nodes
+- **Automatic recovery**: Peers restored on gateway reboot/reprovision
+- **Periodic sync**: Gateways sync mesh state every 10 minutes
+- **Orphan detection**: Automatic cleanup of stale peer data
+
+### Whisper Node (Gateway-to-Gateway)
+- mTLS-secured inter-gateway communication
+- Heartbeat-based health monitoring
+- Mesh-wide peer broadcast with retry logic
+- CRL enforcement for certificate revocation
+
+### AmneziaWG Obfuscation
+- Multiple obfuscation levels (off, low, medium, high, extreme)
+- Junk packet injection
+- Custom magic headers
+- Deep packet inspection resistance
+
+---
+
+## Architecture
+
+```
+                     ┌──────────────────────────────┐
+                     │        Backend Server         │
+                     │   - Account management        │
+                     │   - Subscription control      │
+                     │   - Stores ONLY encrypted     │
+                     │     peer blobs (zero-knowledge)│
+                     └──────────────┬───────────────┘
+                                    │
+                     ┌──────────────┴───────────────┐
+                     │    Backend Mesh Nodes (2x)    │
+                     │   - Persistent blob storage   │
+                     │   - 2x replication            │
+                     │   - Orphan auto-purge         │
+                     └──────────────┬───────────────┘
+                                    │
+          ┌─────────────────────────┼─────────────────────────┐
+          │                         │                         │
+          ▼                         ▼                         ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Gateway 1      │◄───►│   Gateway 2      │◄───►│   Gateway N      │
+│ ┌─────────────┐ │     │ ┌─────────────┐ │     │ ┌─────────────┐ │
+│ │ Whisper Node│ │     │ │ Whisper Node│ │     │ │ Whisper Node│ │
+│ │  - mTLS     │ │     │ │  - mTLS     │ │     │ │  - mTLS     │ │
+│ │  - Mesh sync│ │     │ │  - Mesh sync│ │     │ │  - Mesh sync│ │
+│ └─────────────┘ │     │ └─────────────┘ │     │ └─────────────┘ │
+│ ┌─────────────┐ │     │ ┌─────────────┐ │     │ ┌─────────────┐ │
+│ │ WG Manager  │ │     │ │ WG Manager  │ │     │ │ WG Manager  │ │
+│ │  - REST API │ │     │ │  - REST API │ │     │ │  - REST API │ │
+│ └─────────────┘ │     │ └─────────────┘ │     │ └─────────────┘ │
+│ ┌─────────────┐ │     │ ┌─────────────┐ │     │ ┌─────────────┐ │
+│ │  WireGuard  │ │     │ │  WireGuard  │ │     │ │  WireGuard  │ │
+│ └─────────────┘ │     │ └─────────────┘ │     │ └─────────────┘ │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+```
+
+---
+
+## Prerequisites
 
 - Ubuntu 24.04 LTS (or Debian 12)
 - Python 3.12+
-- WireGuard tools
-- 4-8GB RAM (recommended for RAM-based operations)
+- WireGuard tools (+ AmneziaWG for obfuscation)
+- 4-8GB RAM
 - KVM-based VPS (for kernel module support)
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Install System Requirements
 
@@ -45,7 +108,7 @@ sudo apt install -y \
 
 ```bash
 cd /home/ubuntu
-git clone <YOUR_REPO_URL> wg-manager
+git clone https://github.com/centervpn/vpn-gateway.git wg-manager
 cd wg-manager
 ```
 
@@ -60,395 +123,256 @@ pip install -r requirements.txt
 ### 4. Configure Environment
 
 ```bash
-cd gateway_api
-
-# Create .env file (NEVER commit this!)
 cat > .env <<EOF
+# Gateway API Authentication
 GATEWAY_API_KEY=<generate with: openssl rand -hex 32>
 GATEWAY_PUBLIC_KEY=<optional for encryption>
 MAX_TIMESTAMP_DIFF=300
+
+# WireGuard Configuration
 WG_IPV4_SUBNET=10.0.1.0/24
 WG_IPV6_SUBNET=fd42:4242:1::/64
 WG_DEFAULT_PORT=51820
 DNS_SERVERS={"d1":"1.1.1.1","d2":"8.8.8.8","d3":"9.9.9.9"}
+
+# Database
 DB_PATH=./wireguard.db
+
+# Whisper Node (Mesh)
+WHISPER_VERSION=1.3.0
+MESH_PEER_ADDRESSES=10.100.0.100:8100,10.100.0.101:8100
+BACKEND_MESH_ADDRESSES=127.0.0.1:8101,127.0.0.1:8102
 EOF
 
 chmod 600 .env
 ```
 
-### 5. Generate SSL Certificates
+### 5. Set Up Systemd Services
 
 ```bash
-# Get server's public IP
-SERVER_IP=$(curl -s ifconfig.me)
-
-# Generate self-signed certificate
-openssl req -x509 -newkey rsa:4096 -nodes \
-  -keyout key.pem -out cert.pem -days 365 \
-  -subj "/C=US/ST=State/L=City/O=Organization/CN=${SERVER_IP}"
-
-chmod 600 key.pem cert.pem
-```
-
-### 6. Configure WireGuard
-
-```bash
-# Generate WireGuard keys
-wg genkey | sudo tee /etc/wireguard/privatekey | wg pubkey | sudo tee /etc/wireguard/publickey
-
-# Create config
-sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOF
-[Interface]
-PrivateKey = $(sudo cat /etc/wireguard/privatekey)
-Address = 10.0.1.1/24, fd42:4242:1::1/64
-ListenPort = 51820
-SaveConfig = false
-EOF
-
-# Enable IP forwarding
-echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
-echo "net.ipv6.conf.all.forwarding=1" | sudo tee -a /etc/sysctl.conf
-sudo sysctl -p
-
-# Start WireGuard
-sudo systemctl enable wg-quick@wg0
-sudo systemctl start wg-quick@wg0
-```
-
-### 7. Configure Firewall
-
-```bash
-# Allow WireGuard
-sudo ufw allow 51820/udp comment "WireGuard"
-
-# Allow API from backend IPs only (replace with your backend IPs)
-sudo ufw allow from <BACKEND_IP_1> to any port 8000 proto tcp
-sudo ufw allow from <BACKEND_IP_2> to any port 8000 proto tcp
-sudo ufw deny 8000/tcp
-
-# SSH rate limiting
-sudo ufw limit 22222 comment "SSH"
-
-# Set defaults
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-sudo ufw default allow routed
-
-# Enable
-sudo ufw --force enable
-```
-
-### 8. Configure NAT
-
-```bash
-# Get network interface name
-INTERFACE=$(ip route | grep default | awk '{print $5}')
-
-# Add NAT rule
-sudo iptables -t nat -A POSTROUTING -s 10.0.1.0/24 -o $INTERFACE -j MASQUERADE
-
-# Save
-sudo netfilter-persistent save
-```
-
-### 9. Set Up Systemd Service
-
-```bash
+# Main WireGuard Manager API
 sudo cp systemd/wg-manager.service /etc/systemd/system/
+
+# Whisper Node (Mesh Communication)
+sudo cp systemd/whisper-node.service /etc/systemd/system/
+
 sudo systemctl daemon-reload
-sudo systemctl enable wg-manager
-sudo systemctl start wg-manager
+sudo systemctl enable wg-manager whisper-node
+sudo systemctl start wg-manager whisper-node
 ```
 
-### 10. Configure Sudo Permissions
-
-```bash
-# Allow ubuntu user to run wg command without password
-echo "ubuntu ALL=(ALL) NOPASSWD: /usr/bin/wg" | sudo tee /etc/sudoers.d/wireguard-manager
-sudo chmod 440 /etc/sudoers.d/wireguard-manager
-```
-
-### 11. Initialize Database
-
-```bash
-cd gateway_api
-source ../venv/bin/activate
-python3 -c "from database import init_db; init_db()"
-```
-
-### 12. Verify Installation
+### 6. Verify Installation
 
 ```bash
 # Check services
-sudo systemctl status wg-manager
-sudo systemctl status wg-quick@wg0
+sudo systemctl status wg-manager whisper-node
 
 # Check WireGuard
 sudo wg show
 
-# Test API (replace with actual HMAC signature)
-curl -k https://localhost:8000/api/v1/server/status \
-  -H "signature: <HMAC_SIGNATURE>" \
-  -H "timestamp: $(date +%s)"
+# Check Whisper Node
+curl -sk https://localhost:8100/status
 ```
 
 ---
 
-## 📖 API Endpoints
+## API Endpoints
 
-### Base URL
+### WireGuard Manager (Port 8000)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/configurations/` | Create peer configuration |
+| PUT | `/api/v1/configurations/{pubkey}/status` | Update peer status |
+| DELETE | `/api/v1/configurations/{pubkey}` | Delete peer |
+| GET | `/api/v1/ip-usage` | Get IP allocation stats |
+| GET | `/api/v1/server/status` | Get server status |
+| GET | `/api/v1/server/metrics` | Get detailed metrics |
+
+### Whisper Node (Port 8100)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/status` | Node health status |
+| GET | `/whisper/peer-data/stats` | Mesh storage statistics |
+| POST | `/whisper/peer-data/store` | Store encrypted peer blob |
+| POST | `/whisper/peer-data/retrieve` | Retrieve peer blobs |
+| POST | `/whisper/mesh/sync` | Full mesh synchronization |
+| POST | `/whisper/heartbeat` | Inter-gateway heartbeat |
+
+---
+
+## Mesh Peer Recovery
+
+### How It Works
+
+1. **Peer Creation**: When a peer is created, its configuration is:
+   - Encrypted with gateway's derived key
+   - Broadcast to all mesh nodes (gateways + backend)
+   - Stored with identity hash for ownership
+
+2. **Gateway Recovery**: On startup, the gateway:
+   - Queries mesh for blobs matching its identity hash
+   - Decrypts and restores peer configurations
+   - Falls back to WireGuard interface scan if mesh is empty
+
+3. **Periodic Sync**: Every 10 minutes:
+   - Gateway syncs all blobs from mesh
+   - Ensures consistency across nodes
+   - Detects and reports orphaned blobs
+
+### Identity Hash
+
+Each gateway is identified by a SHA256 hash of its WireGuard public key:
+
+```python
+identity_hash = sha256(wg_public_key.encode()).hexdigest()[:16]
+# Example: "d564e8b81e63d43d"
 ```
-https://<gateway-ip>:8000
-```
+
+### Orphan Detection
+
+Blobs are flagged as "orphaned" when:
+- The owning gateway has been deleted
+- The gateway's identity no longer matches any active gateway
+- Auto-purged after 7 days of orphan status
+
+---
+
+## Security
 
 ### Authentication
-All endpoints require HMAC-SHA256 authentication:
-- Header: `signature: <hmac_hex>`
-- Header: `timestamp: <unix_timestamp>`
+- **HMAC-SHA256**: All API requests signed with shared secret
+- **mTLS**: Inter-gateway communication uses mutual TLS
+- **Certificate Revocation**: CRL enforcement for compromised certs
 
-### Available Endpoints
+### Encryption
+- **AES-256-GCM**: Optional payload encryption
+- **Zero-knowledge mesh**: Backend never sees plaintext peer configs
+- **HKDF key derivation**: Secure key generation from secrets
 
-#### Create Peer Configuration
-```http
-POST /api/v1/configurations/
-```
-
-#### Update Peer Status
-```http
-PUT /api/v1/configurations/{public_key}/status
-```
-
-#### Delete Peer
-```http
-DELETE /api/v1/configurations/{public_key}
-```
-
-#### Get IP Usage Statistics
-```http
-GET /api/v1/ip-usage
-```
-
-#### Get Server Status
-```http
-GET /api/v1/server/status
-```
-
-#### Get Detailed Metrics
-```http
-GET /api/v1/server/metrics
-```
-
-**Full API documentation:** See [docs/API.md](docs/API.md)
+### Network
+- **Firewall**: UFW with strict ingress rules
+- **IP whitelist**: API accessible only from backend
+- **Rate limiting**: SSH and API rate limits
 
 ---
 
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────┐
-│         Backend Server                   │
-│  - Account management                    │
-│  - Subscription control                  │
-│  - Source of truth                       │
-└──────────────┬──────────────────────────┘
-               │
-               │ HTTPS + HMAC
-               │ (Backend → Gateway only)
-               ▼
-┌─────────────────────────────────────────┐
-│         Gateway Server                   │
-│  ┌─────────────────────────────────┐   │
-│  │   FastAPI Application            │   │
-│  │   - Peer management              │   │
-│  │   - HMAC auth                    │   │
-│  │   - AES-GCM encryption           │   │
-│  └──────────┬──────────────────────┘   │
-│             ▼                            │
-│  ┌─────────────────────────────────┐   │
-│  │   WireGuard Manager              │   │
-│  │   - IP allocation                │   │
-│  │   - Peer creation/deletion       │   │
-│  │   - Thread-safe operations       │   │
-│  └──────────┬──────────────────────┘   │
-│             ▼                            │
-│  ┌─────────────────────────────────┐   │
-│  │   WireGuard Kernel               │   │
-│  │   - wg0 interface                │   │
-│  │   - Peer tunnels                 │   │
-│  └─────────────────────────────────┘   │
-└─────────────────────────────────────────┘
-```
-
----
-
-## 🔐 Security
-
-### HMAC Authentication
-- Algorithm: HMAC-SHA256
-- Message format: `timestamp={unix_time}, body_length={length}`
-- Time window: 60 seconds
-- Constant-time comparison
-
-### Payload Encryption (Optional)
-- Algorithm: AES-256-GCM
-- Key derivation: HKDF-SHA256
-- IV: 12 bytes (random)
-- Authenticated encryption
-
-### Network Security
-- API accessible only from whitelisted backend IPs
-- HTTPS/TLS encryption
-- UFW firewall
-- Rate-limited SSH
-
----
-
-## 📊 Monitoring
+## Monitoring
 
 ### Service Health
-```bash
-# Service status
-sudo systemctl status wg-manager wg-quick@wg0
 
-# Live logs
+```bash
+# All services
+sudo systemctl status wg-manager whisper-node wg-quick@wg0
+
+# Logs
 sudo journalctl -u wg-manager -f
-
-# Recent logs
-sudo journalctl -u wg-manager -n 100 --no-pager
+sudo journalctl -u whisper-node -f
 ```
 
-### WireGuard Status
+### Mesh Status
+
 ```bash
-# All peers
-sudo wg show
+# Local mesh stats
+curl -sk https://localhost:8100/whisper/peer-data/stats | jq
 
-# Peer count
-sudo wg show wg0 peers | wc -l
-
-# Specific peer
-sudo wg show wg0 peer <PUBLIC_KEY>
+# Response includes:
+# - total_identities: Number of gateways with stored blobs
+# - total_blobs: Total peer configurations stored
+# - own_identity_hash: This gateway's identity
+# - own_blobs: Blobs belonging to this gateway
 ```
 
-### Performance Metrics
-```bash
-# Via API
-curl -k https://localhost:8000/api/v1/server/metrics \
-  -H "signature: <HMAC>" \
-  -H "timestamp: $(date +%s)"
+### Dashboard
 
-# System resources
-htop
-free -h
-df -h
-```
+Access the admin dashboard at `https://call.centervpn.net/#/mesh-dashboard` for:
+- Real-time mesh health
+- Backend node status
+- Gateway connectivity
+- Orphaned blob detection
 
 ---
 
-## 🔧 Configuration
+## Configuration Reference
 
-### Environment Variables (.env)
+### Environment Variables
 
-| Variable | Description | Required | Example |
-|----------|-------------|----------|---------|
-| `GATEWAY_API_KEY` | HMAC authentication key | Yes | `8f29c82c...` |
-| `GATEWAY_PUBLIC_KEY` | Payload encryption key | No | `tqgwn3SO...` |
-| `WG_IPV4_SUBNET` | IPv4 subnet for peers | Yes | `10.0.1.0/24` |
-| `WG_IPV6_SUBNET` | IPv6 subnet for peers | Yes | `fd42:4242:1::/64` |
-| `WG_DEFAULT_PORT` | WireGuard listen port | Yes | `51820` |
-| `DNS_SERVERS` | DNS server options | Yes | `{"d1":"1.1.1.1",...}` |
-| `DB_PATH` | SQLite database path | Yes | `./wireguard.db` |
-| `MAX_TIMESTAMP_DIFF` | HMAC time window (sec) | No | `300` |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GATEWAY_API_KEY` | HMAC authentication key | Required |
+| `WHISPER_VERSION` | Software version string | `1.0.0` |
+| `WG_IPV4_SUBNET` | IPv4 allocation pool | `10.0.1.0/24` |
+| `WG_IPV6_SUBNET` | IPv6 allocation pool | `fd42:4242:1::/64` |
+| `MESH_PEER_ADDRESSES` | Other gateway addresses | `` |
+| `BACKEND_MESH_ADDRESSES` | Backend mesh node addresses | `` |
+| `HEARTBEAT_INTERVAL` | Heartbeat frequency (sec) | `10` |
+| `PERIODIC_MESH_SYNC_INTERVAL` | Full sync frequency (sec) | `600` |
 
 ---
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
-### API Won't Start
+### Peers Not Recovering
+
 ```bash
-# Check port
-sudo netstat -tlnp | grep 8000
+# Check mesh connectivity
+curl -sk https://localhost:8100/whisper/peer-data/stats | jq '.own_blobs'
 
+# Check identity hash matches
+curl -sk https://localhost:8100/whisper/peer-data/stats | jq '.own_identity_hash'
+
+# Force mesh sync
+curl -sk -X POST https://localhost:8100/whisper/mesh/sync
+```
+
+### Whisper Node Won't Start
+
+```bash
 # Check certificates
-ls -lh gateway_api/key.pem gateway_api/cert.pem
+ls -la /home/ubuntu/wg-manager/gateway_api/cert.pem key.pem ca.crt
+
+# Check port
+sudo netstat -tlnp | grep 8100
 
 # Check logs
-sudo journalctl -u wg-manager -n 100
+sudo journalctl -u whisper-node -n 100
 ```
 
-### Peers Can't Connect
+### All Blobs Showing as Orphaned
+
+This typically indicates an identity hash mismatch. Verify:
 ```bash
-# Check WireGuard
-sudo wg show
+# Gateway's own identity hash
+curl -sk https://localhost:8100/whisper/peer-data/stats | jq '.own_identity_hash'
 
-# Check firewall
-sudo ufw status verbose
-
-# Check IP forwarding
-sysctl net.ipv4.ip_forward
-
-# Check NAT
-sudo iptables -t nat -L -n -v
-```
-
-### HMAC Authentication Fails
-```bash
-# Check API key matches backend
-grep GATEWAY_API_KEY .env
-
-# Check time sync
-date
-# Should match backend server time within 60 seconds
-
-# Check signature generation
-# See docs/HMAC_AUTHENTICATION.md
+# Should match one of the identity_hash values in storage_summary
+curl -sk https://localhost:8100/whisper/peer-data/stats | jq '.storage_summary[].identity_hash'
 ```
 
 ---
 
-## 📚 Documentation
+## Documentation
 
-- **[docs/API.md](docs/API.md)** - Complete API reference
-- **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** - Deployment guide
-- **[docs/SECURITY.md](docs/SECURITY.md)** - Security documentation
-- **[docs/RAM_BASED.md](docs/RAM_BASED.md)** - RAM-based gateway setup
-- **[docs/AMNEZIAVPN.md](docs/AMNEZIAVPN.md)** - AmneziaVPN integration
-
----
-
-## 🔄 Development
-
-### Running Locally
-
-```bash
-source venv/bin/activate
-cd gateway_api
-uvicorn main:app --reload --port 8000
-```
-
-### Testing
-
-```bash
-# Test peer creation
-python3 tests/test_peer_creation.py
-
-# Test authentication
-python3 tests/test_hmac_auth.py
-```
+- **[docs/MESH_RECOVERY.md](docs/MESH_RECOVERY.md)** - Detailed mesh recovery documentation
+- **[docs/WHISPER_NODE.md](docs/WHISPER_NODE.md)** - Whisper Node protocol
+- **[docs/AMNEZIAWG.md](docs/AMNEZIAWG.md)** - AmneziaWG obfuscation setup
+- **[DEPLOYMENT_QUICK_START.md](DEPLOYMENT_QUICK_START.md)** - Quick deployment guide
 
 ---
 
-## 📞 Support
+## Version History
 
-For issues or questions:
-- Check logs: `sudo journalctl -u wg-manager`
-- Review API docs: `docs/API.md`
-- Security guide: `docs/SECURITY.md`
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.3.0 | 2026-01-14 | Fixed orphan detection identity hash matching |
+| 1.2.0 | 2026-01-13 | Added periodic mesh sync, broadcast retry |
+| 1.1.0 | 2026-01-11 | Added WireGuard fallback recovery |
+| 1.0.0 | 2026-01-10 | Initial mesh peer recovery system |
 
 ---
 
-**Version:** 2.0  
-**Status:** Production Ready  
-**License:** Private/Proprietary  
-**Last Updated:** December 8, 2025
-
+**Version:** 1.3.0  
+**Status:** Production  
+**License:** Proprietary  
+**Last Updated:** January 14, 2026

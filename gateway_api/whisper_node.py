@@ -1211,12 +1211,16 @@ async def get_peer_data_stats(s: WhisperState = Depends(get_state)):
     except Exception:
         own_identity = ""
     
+    # Compute identity hash for backend matching
+    own_identity_hash = hashlib.sha256(own_identity.encode()).hexdigest()[:16] if own_identity else ""
+    
     stats = {
         "total_identities": len(peer_recovery_store),
         "total_blobs": sum(len(d["blobs"]) for d in peer_recovery_store.values()),
         "by_status": {"active": 0, "suspended": 0, "unknown": 0},
         # Own stats - only this gateway's blobs
         "own_identity": own_identity[:16] + "..." if own_identity else "",
+        "own_identity_hash": own_identity_hash,  # Full hash for backend matching
         "own_blobs": 0,
         "own_by_status": {"active": 0, "suspended": 0, "unknown": 0},
         "recent_events": recovery_events[-20:],  # Last 20 events
