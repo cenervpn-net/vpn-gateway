@@ -242,20 +242,29 @@ class MeshPeerSync:
             logger.warning("No mesh nodes configured - skipping broadcast")
             return 0, 0
         
+        # Store broadcast targets (actual nodes to send to)
+        broadcast_targets = dict(mesh_nodes)
+        
+        # CRITICAL: Include our own pubkey for key wrapping (so we can decrypt during recovery)
+        # But DON'T broadcast to ourselves - just use for key generation
+        own_pubkey = self.identity.public_key_b64()
+        mesh_nodes_for_encryption = dict(mesh_nodes)
+        mesh_nodes_for_encryption[own_pubkey] = own_pubkey  # For self-wrapped key generation
+        
         # Increment version
         self._config_version += 1
         self._save_config_version()
         
-        # Encrypt peer config
+        # Encrypt peer config (includes self-wrapped key)
         blob, wrapped_keys = self.crypto.encrypt_peer_config(
             peer_config,
-            mesh_nodes,
+            mesh_nodes_for_encryption,
             version=self._config_version
         )
         
-        # Broadcast to all nodes
+        # Broadcast to actual nodes only (not ourselves)
         success_count = 0
-        total_count = len(mesh_nodes)
+        total_count = len(broadcast_targets)
         
         # Generate peer_id for status lookups (hash of public_key)
         peer_public_key = peer_config.get("public_key", "")
@@ -272,15 +281,19 @@ class MeshPeerSync:
                 is_backend = self._mesh_nodes.get(addr, {}).get("type") == "backend"
                 
                 if is_backend:
-                    # Backend nodes store blobs without decryption - use placeholder wrapped_key
+                    # Backend nodes store blobs for recovery
+                    # Include self-wrapped key so we can decrypt our own blobs during recovery
+                    own_pubkey = self.identity.public_key_b64()
+                    self_wrapped = wrapped_keys.get(own_pubkey)
+                    
                     payload = {
-                        "identity_pubkey": self.identity.public_key_b64(),
+                        "identity_pubkey": own_pubkey,
                         "blob_hash": blob.blob_hash,
                         "encrypted_blob": blob.encrypted_data,
                         "blob_nonce": blob.nonce,
                         "version": blob.version,
-                        "wrapped_key": "",  # Backend doesn't need this
-                        "wrapped_key_nonce": "",
+                        "wrapped_key": self_wrapped.wrapped_key if self_wrapped else "",
+                        "wrapped_key_nonce": self_wrapped.nonce if self_wrapped else "",
                         "timestamp": blob.timestamp,
                         "signature": "",
                         "peer_id": config_peer_id  # For status lookups
@@ -344,8 +357,8 @@ class MeshPeerSync:
             except Exception as e:
                 logger.warning(f"Failed to broadcast to {addr}: {e}")
         
-        # Send in parallel
-        tasks = [send_to_peer(ip, ip) for ip in mesh_nodes.keys()]
+        # Send in parallel (to broadcast_targets, not ourselves)
+        tasks = [send_to_peer(ip, ip) for ip in broadcast_targets.keys()]
         await asyncio.gather(*tasks)
         
         logger.info(f"Broadcast peer config v{self._config_version} to {success_count}/{total_count} mesh nodes")
@@ -434,24 +447,35 @@ class MeshPeerSync:
                 message="Quorum not achieved"
             )
         
-        # Decrypt configs from first agreeing peer's response
+        # Decrypt configs - prefer backend nodes (they have self-wrapped keys)
         recovered_configs = []
         
         if quorum_result.agreeing_peers:
-            first_peer = quorum_result.agreeing_peers[0]
-            peer_response = responses[first_peer]
+            # Sort peers: backend nodes first (they store self-wrapped keys)
+            backend_peers = [p for p in quorum_result.agreeing_peers 
+                            if self._mesh_nodes.get(p, {}).get("type") == "backend"]
+            gateway_peers = [p for p in quorum_result.agreeing_peers 
+                            if self._mesh_nodes.get(p, {}).get("type") != "backend"]
+            peers_to_try = backend_peers + gateway_peers
             
-            if peer_response.get("status") == "ok" and peer_response.get("blobs"):
-                try:
-                    recovered_configs = self._decrypt_blobs(
-                        peer_response["blobs"],
-                        peer_response.get("wrapped_key"),
-                        peer_response.get("wrapped_key_nonce"),
-                        first_peer
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to decrypt blobs: {e}")
-                    errors.append(f"Decryption failed: {e}")
+            # Try each peer until we successfully decrypt
+            for peer_addr in peers_to_try:
+                peer_response = responses[peer_addr]
+                
+                if peer_response.get("status") == "ok" and peer_response.get("blobs"):
+                    try:
+                        recovered_configs = self._decrypt_blobs(
+                            peer_response["blobs"],
+                            peer_response.get("wrapped_key"),
+                            peer_response.get("wrapped_key_nonce"),
+                            peer_addr
+                        )
+                        if recovered_configs:
+                            logger.info(f"Successfully recovered {len(recovered_configs)} configs from {peer_addr}")
+                            break  # Success - stop trying
+                    except Exception as e:
+                        logger.warning(f"Failed to decrypt blobs from {peer_addr}: {e}")
+                        continue  # Try next peer
         
         return RecoveryResult(
             success=len(recovered_configs) > 0,
@@ -521,37 +545,57 @@ class MeshPeerSync:
         wrapped_key_nonce: str,
         peer_ip: str
     ) -> List[dict]:
-        """Decrypt peer config blobs"""
-        if not wrapped_key:
-            raise ValueError("No wrapped key provided")
+        """
+        Decrypt peer config blobs.
         
-        # Get node's public key for ECDH
+        Uses per-blob wrapped_key if available (self-wrapped for backend recovery),
+        falls back to response-level wrapped_key (from gateway nodes).
+        """
+        # Get node's public key for ECDH (or use our own for self-wrapped keys)
         peer_info = self._mesh_nodes.get(peer_ip, {})
         peer_pubkey = peer_info.get("pubkey")
-        
-        if not peer_pubkey:
-            raise ValueError(f"No public key for peer {peer_ip}")
+        own_pubkey = self.identity.public_key_b64()
         
         configs = []
         
         for blob_dict in blobs:
             try:
+                # Use per-blob wrapped_key if available, else response-level
+                blob_wrapped_key = blob_dict.get("wrapped_key", "")
+                blob_wrapped_nonce = blob_dict.get("wrapped_key_nonce", "")
+                
+                # Determine which wrapped key to use
+                use_wrapped_key = blob_wrapped_key or wrapped_key
+                use_wrapped_nonce = blob_wrapped_nonce or wrapped_key_nonce
+                
+                if not use_wrapped_key:
+                    logger.warning(f"No wrapped key for blob {blob_dict.get('blob_hash', 'unknown')[:8]}")
+                    continue
+                
+                # Use our own pubkey for decryption (self-wrapped keys) 
+                # or peer's pubkey for gateway-wrapped keys
+                decrypt_pubkey = own_pubkey if blob_wrapped_key else peer_pubkey
+                
+                if not decrypt_pubkey:
+                    logger.warning(f"No public key for decryption")
+                    continue
+                
                 blob = EncryptedPeerBlob(
                     blob_hash=blob_dict["blob_hash"],
                     encrypted_data=blob_dict["encrypted_blob"],
                     nonce=blob_dict["blob_nonce"],
                     version=blob_dict["version"],
                     timestamp=blob_dict["timestamp"],
-                    owner_identity=self.identity.public_key_b64()
+                    owner_identity=own_pubkey
                 )
                 
                 wk = WrappedKeyBundle(
                     peer_pubkey_hash="",  # Not needed for decryption
-                    wrapped_key=wrapped_key,
-                    nonce=wrapped_key_nonce
+                    wrapped_key=use_wrapped_key,
+                    nonce=use_wrapped_nonce
                 )
                 
-                config = self.crypto.decrypt_peer_config(blob, wk, peer_pubkey)
+                config = self.crypto.decrypt_peer_config(blob, wk, decrypt_pubkey)
                 
                 # Override status with storage-level status (reflects suspend/resume)
                 storage_status = blob_dict.get("status", "active")
