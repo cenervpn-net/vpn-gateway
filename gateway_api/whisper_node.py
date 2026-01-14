@@ -41,6 +41,10 @@ BACKEND_MGMT_IP = "10.100.0.1"
 BACKEND_WHISPER_PORT = 8100
 BACKEND_API_URL = "http://10.100.0.1:8001"  # HTTP over wg_mgmt (WireGuard-encrypted)
 
+# Tombstone configuration - deleted blobs are kept for propagation, then garbage collected
+TOMBSTONE_TTL_DAYS = 7  # Keep tombstones for 7 days to ensure propagation across mesh
+TOMBSTONE_GC_INTERVAL = 3600  # Run garbage collection every hour
+
 # Paths (will be configured via env)
 CERT_PATH = os.environ.get("WHISPER_CERT", "/home/ubuntu/wg-manager/gateway_api/cert.pem")
 KEY_PATH = os.environ.get("WHISPER_KEY", "/home/ubuntu/wg-manager/gateway_api/key.pem")
@@ -221,7 +225,7 @@ state: Optional[WhisperState] = None
 # =============================================================================
 
 # Software version - read from environment (set by deployment/provisioning)
-SOFTWARE_VERSION = os.environ.get("WG_MANAGER_VERSION", "1.0.0")
+SOFTWARE_VERSION = os.environ.get("WG_MANAGER_VERSION", "1.4.0")
 WG_MANAGER_VERSION = os.environ.get("WG_MANAGER_VERSION", "1.0.0")
 GATEWAY_API_VERSION = os.environ.get("GATEWAY_API_VERSION", "1.0.0")
 
@@ -791,6 +795,176 @@ def mesh_sync_worker():
             time.sleep(30)  # Wait longer on error
 
 
+def tombstone_gc_worker():
+    """
+    Background thread that garbage collects old tombstones.
+    
+    Tombstones (deleted blobs) are kept for TOMBSTONE_TTL_DAYS to allow
+    propagation across all mesh nodes. After the TTL, they are permanently removed.
+    
+    This ensures deletions propagate to all nodes before being garbage collected.
+    """
+    global peer_recovery_store
+    
+    logger.info(f"Tombstone GC worker started (interval: {TOMBSTONE_GC_INTERVAL}s, TTL: {TOMBSTONE_TTL_DAYS} days)")
+    
+    # Wait for initial startup
+    time.sleep(120)
+    
+    while True:
+        try:
+            gc_count = 0
+            now = datetime.now(timezone.utc)
+            
+            for identity in list(peer_recovery_store.keys()):
+                blobs = peer_recovery_store[identity].get("blobs", [])
+                original_count = len(blobs)
+                
+                # Filter out old tombstones
+                active_blobs = []
+                for blob in blobs:
+                    if blob.get("status") == "deleted":
+                        deleted_at_str = blob.get("deleted_at")
+                        if deleted_at_str:
+                            try:
+                                deleted_at = datetime.fromisoformat(deleted_at_str.replace("Z", "+00:00"))
+                                age_days = (now - deleted_at).days
+                                if age_days >= TOMBSTONE_TTL_DAYS:
+                                    # Tombstone is old enough to garbage collect
+                                    gc_count += 1
+                                    logger.debug(f"GC tombstone {blob.get('blob_hash', '')[:8]}... ({age_days} days old)")
+                                    continue  # Skip (don't add to active_blobs)
+                            except:
+                                pass
+                    active_blobs.append(blob)
+                
+                peer_recovery_store[identity]["blobs"] = active_blobs
+                
+                # Clean up empty identity
+                if not peer_recovery_store[identity]["blobs"]:
+                    del peer_recovery_store[identity]
+            
+            if gc_count > 0:
+                logger.info(f"Tombstone GC: removed {gc_count} old tombstones")
+            
+        except Exception as e:
+            logger.error(f"Tombstone GC error: {e}")
+        
+        time.sleep(TOMBSTONE_GC_INTERVAL)
+
+
+# Orphan reconciliation interval - check every 5 minutes
+ORPHAN_RECONCILE_INTERVAL = 300
+
+
+def orphan_reconciliation_worker():
+    """
+    Background thread that reconciles whisper blobs against actual WireGuard peers.
+    
+    This is critical for mesh consistency - it automatically tombstones blobs
+    that don't correspond to active WireGuard peers, preventing "zombie" blobs
+    from being restored during recovery.
+    
+    Only reconciles OUR OWN blobs (not blobs we're storing for other gateways).
+    """
+    global peer_recovery_store
+    
+    logger.info(f"Orphan reconciliation worker started (interval: {ORPHAN_RECONCILE_INTERVAL}s)")
+    
+    # Wait for services to fully start
+    time.sleep(180)  # 3 minutes - enough for mesh sync and peer recovery
+    
+    while True:
+        try:
+            # Get our identity
+            own_identity = None
+            try:
+                from peer_recovery_crypto import derive_mesh_identity
+                identity = derive_mesh_identity()
+                if identity:
+                    own_identity = identity.public_key_b64()
+            except Exception as e:
+                logger.debug(f"Could not get own identity: {e}")
+            
+            if not own_identity:
+                logger.debug("Orphan reconciliation skipped: no identity")
+                time.sleep(ORPHAN_RECONCILE_INTERVAL)
+                continue
+            
+            # Get actual WireGuard peers (ground truth)
+            import subprocess
+            active_pubkeys = set()
+            try:
+                for iface in ['wg0', 'wg1', 'wg2', 'wg3']:
+                    result = subprocess.run(
+                        ['sudo', 'awg', 'show', iface, 'peers'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0:
+                        for line in result.stdout.strip().split('\n'):
+                            pubkey = line.strip()
+                            if pubkey:
+                                active_pubkeys.add(pubkey)
+            except Exception as e:
+                logger.warning(f"Could not get WireGuard peers: {e}")
+                time.sleep(ORPHAN_RECONCILE_INTERVAL)
+                continue
+            
+            # Check our own blobs against active peers
+            if own_identity not in peer_recovery_store:
+                time.sleep(ORPHAN_RECONCILE_INTERVAL)
+                continue
+            
+            blobs = peer_recovery_store[own_identity].get("blobs", [])
+            orphaned_count = 0
+            
+            for blob in blobs:
+                if blob.get("status") == "deleted":
+                    continue  # Already a tombstone
+                
+                # Try to match blob's peer_id to an active pubkey
+                blob_peer_id = blob.get("peer_id", "")
+                is_orphan = True
+                
+                for pubkey in active_pubkeys:
+                    # Compute peer_id the same way as broadcast_peer_config
+                    computed_id = hashlib.sha256(
+                        json.dumps({"public_key": pubkey}, sort_keys=True).encode()
+                    ).hexdigest()
+                    if computed_id == blob_peer_id:
+                        is_orphan = False
+                        break
+                
+                if is_orphan and blob_peer_id:
+                    # Mark as tombstone
+                    blob["status"] = "deleted"
+                    blob["deleted_at"] = datetime.now(timezone.utc).isoformat()
+                    orphaned_count += 1
+                    logger.info(f"ORPHAN RECONCILED: tombstoned blob {blob.get('blob_hash', '')[:8]}... (peer_id: {blob_peer_id[:16]}...)")
+            
+            if orphaned_count > 0:
+                logger.info(f"Orphan reconciliation: tombstoned {orphaned_count} orphaned blobs")
+                
+                # Broadcast tombstones to mesh
+                try:
+                    from mesh_peer_sync import get_mesh_sync
+                    import asyncio
+                    
+                    async def broadcast_tombstones():
+                        sync = await get_mesh_sync()
+                        await sync.sync_to_mesh()
+                    
+                    asyncio.run(broadcast_tombstones())
+                    logger.info("Broadcast orphan tombstones to mesh")
+                except Exception as e:
+                    logger.warning(f"Could not broadcast tombstones: {e}")
+            
+        except Exception as e:
+            logger.error(f"Orphan reconciliation error: {e}")
+        
+        time.sleep(ORPHAN_RECONCILE_INTERVAL)
+
+
 # =============================================================================
 # Peer Data Sync (VPN Peer Configurations) - Secure Recovery Protocol
 # =============================================================================
@@ -922,6 +1096,9 @@ async def handle_recovery_request(request: SecureRecoveryRequest, s: WhisperStat
     """
     Handle a recovery request from a gateway.
     
+    Returns only active/suspended blobs - tombstoned blobs are excluded.
+    This ensures deleted peers are not accidentally restored.
+    
     Security:
     - Requester proves identity via signature (derived from WG keys)
     - We return encrypted data that only the true owner can decrypt
@@ -932,7 +1109,6 @@ async def handle_recovery_request(request: SecureRecoveryRequest, s: WhisperStat
     
     # Verify timestamp freshness
     try:
-        from datetime import timezone
         request_time = datetime.fromisoformat(request.timestamp.replace('Z', '+00:00'))
         now = datetime.now(timezone.utc)
         age = abs((now - request_time).total_seconds())
@@ -955,25 +1131,32 @@ async def handle_recovery_request(request: SecureRecoveryRequest, s: WhisperStat
     
     stored = peer_recovery_store[identity]
     
+    # Filter out deleted (tombstoned) blobs - only return active/suspended
+    all_blobs = stored.get("blobs", [])
+    active_blobs = [b for b in all_blobs if b.get("status") != "deleted"]
+    tombstoned_count = len(all_blobs) - len(active_blobs)
+    
     # Record recovery attempt
     recovery_events.append({
         "type": "RECOVERY_REQUESTED",
         "identity_hash": hashlib.sha256(identity.encode()).hexdigest()[:16],
-        "blob_count": len(stored["blobs"]),
+        "blob_count": len(active_blobs),
+        "tombstones_excluded": tombstoned_count,
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
     
-    logger.info(f"Recovery request from {identity[:16]}... returning {len(stored['blobs'])} blobs")
+    logger.info(f"Recovery request from {identity[:16]}... returning {len(active_blobs)} blobs ({tombstoned_count} tombstones excluded)")
     
-    # Return all stored blobs and the wrapped key
+    # Return only active/suspended blobs and the wrapped key
     # The requester will verify quorum across multiple peers
     # and decrypt using their WG-derived identity key
     return {
         "status": "ok",
-        "blobs": stored["blobs"],
+        "blobs": active_blobs,
         "wrapped_key": stored["wrapped_key"],
         "wrapped_key_nonce": stored["wrapped_key_nonce"],
-        "blob_count": len(stored["blobs"]),
+        "blob_count": len(active_blobs),
+        "tombstones_excluded": tombstoned_count,
         "stored_at": stored["stored_at"],
         "responder": s.gateway_name,
         "responder_mgmt_ip": s.mgmt_ip
@@ -1046,10 +1229,13 @@ class PeerQueryRequest(BaseModel):
 @app.post("/whisper/peer-data/purge-blob")
 async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(get_state)):
     """
-    Purge a specific peer blob (on peer deletion).
+    Mark a specific peer blob as deleted (tombstone) on peer deletion.
     
-    This is cleaner than tombstones - it removes the actual data
-    so deleted peers cannot be accidentally recovered.
+    Tombstones propagate during mesh sync to ensure all nodes learn about deletions.
+    This is critical for mesh consistency - old approach of immediate deletion
+    caused deleted peers to reappear when nodes synced with outdated data.
+    
+    Old tombstones are garbage collected after TOMBSTONE_TTL_DAYS.
     
     Called by gateway when a peer is deleted.
     Matches by peer_id (preferred) or blob_hash.
@@ -1060,38 +1246,40 @@ async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(g
     blob_hash = request.blob_hash
     peer_id = request.peer_id
     
+    # If peer_public_key provided, compute peer_id from it
+    # MUST match the hash used in mesh_peer_sync.broadcast_peer_config()
+    if request.peer_public_key and not peer_id:
+        # Use same format as mesh_peer_sync: hash_peer_config({"public_key": ...})
+        peer_id = hashlib.sha256(json.dumps({"public_key": request.peer_public_key}, sort_keys=True).encode()).hexdigest()
+        logger.info(f"Computed peer_id from peer_public_key: {peer_id[:16]}...")
+    
     if identity not in peer_recovery_store:
         return {"status": "not_found", "message": "No data for this identity"}
     
-    # Find and remove the specific blob
+    # Find and mark matching blobs as deleted (tombstone)
     blobs = peer_recovery_store[identity]["blobs"]
-    original_count = len(blobs)
+    tombstoned_count = 0
     
-    # Remove blobs matching by peer_id (preferred) or blob_hash
-    def should_keep(b):
+    for blob in blobs:
+        matches = False
         # Match by peer_id if provided (preferred for deletion)
-        if peer_id and b.get("peer_id") == peer_id:
-            return False
+        if peer_id and blob.get("peer_id") == peer_id:
+            matches = True
         # Match by blob_hash if provided
-        if blob_hash and b.get("blob_hash") == blob_hash:
-            return False
-        return True
-    
-    peer_recovery_store[identity]["blobs"] = [b for b in blobs if should_keep(b)]
-    
-    removed_count = original_count - len(peer_recovery_store[identity]["blobs"])
-    
-    # If no blobs left, clean up the identity entry
-    if not peer_recovery_store[identity]["blobs"]:
-        del peer_recovery_store[identity]
-        logger.info(f"Removed last blob for identity {identity[:16]}... - identity entry cleaned up")
-    
-    if removed_count > 0:
-        match_key = peer_id[:16] if peer_id else blob_hash[:16] if blob_hash else "unknown"
-        logger.info(f"PURGED blob (match: {match_key}...) for identity {identity[:16]}... - reason: {request.reason}")
+        if blob_hash and blob.get("blob_hash") == blob_hash:
+            matches = True
         
+        if matches and blob.get("status") != "deleted":
+            blob["status"] = "deleted"
+            blob["deleted_at"] = datetime.now(timezone.utc).isoformat()
+            tombstoned_count += 1
+            
+            match_key = blob.get("peer_id", "")[:16] or blob.get("blob_hash", "")[:16]
+            logger.info(f"TOMBSTONED blob (match: {match_key}...) for identity {identity[:16]}... - reason: {request.reason}")
+    
+    if tombstoned_count > 0:
         recovery_events.append({
-            "type": "BLOB_PURGED",
+            "type": "BLOB_TOMBSTONED",
             "identity_hash": hashlib.sha256(identity.encode()).hexdigest()[:16],
             "peer_id": peer_id[:16] if peer_id else "",
             "blob_hash": blob_hash[:16] if blob_hash else "",
@@ -1099,9 +1287,45 @@ async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(g
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
         
-        return {"status": "purged", "blobs_removed": removed_count}
+        return {"status": "tombstoned", "blobs_marked": tombstoned_count}
     
-    return {"status": "not_found", "message": "Blob not found"}
+    return {"status": "not_found", "message": "Blob not found or already deleted"}
+
+
+@app.post("/whisper/peer-data/purge-tombstones")
+async def purge_tombstones(s: WhisperState = Depends(get_state)):
+    """
+    Force garbage collection of all tombstoned blobs.
+    
+    Normally tombstones are kept for TOMBSTONE_TTL_DAYS (7 days) to ensure
+    deletion propagates across all mesh nodes. This endpoint allows manual
+    purging for testing/development.
+    
+    Security: Should be admin-only (backend-initiated).
+    """
+    global peer_recovery_store, recovery_events
+    
+    purged_count = 0
+    
+    for identity, data in peer_recovery_store.items():
+        original_count = len(data["blobs"])
+        # Remove all blobs with status="deleted"
+        data["blobs"] = [b for b in data["blobs"] if b.get("status") != "deleted"]
+        removed = original_count - len(data["blobs"])
+        purged_count += removed
+        
+        if removed > 0:
+            logger.info(f"Purged {removed} tombstones for identity {identity[:16]}...")
+    
+    if purged_count > 0:
+        recovery_events.append({
+            "type": "TOMBSTONES_PURGED",
+            "purged_count": purged_count,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+    
+    logger.info(f"Manual tombstone purge: removed {purged_count} tombstones")
+    return {"status": "ok", "purged": purged_count}
 
 
 @app.patch("/whisper/peer-data/status")
@@ -1201,6 +1425,7 @@ async def get_peer_data_stats(s: WhisperState = Depends(get_state)):
     Returns:
     - Total stats: all blobs stored on this node (mesh replication)
     - Own stats: only blobs belonging to THIS gateway's identity
+    - Tombstone counts: deleted blobs pending garbage collection
     """
     global peer_recovery_store, recovery_events
     
@@ -1217,12 +1442,12 @@ async def get_peer_data_stats(s: WhisperState = Depends(get_state)):
     stats = {
         "total_identities": len(peer_recovery_store),
         "total_blobs": sum(len(d["blobs"]) for d in peer_recovery_store.values()),
-        "by_status": {"active": 0, "suspended": 0, "unknown": 0},
+        "by_status": {"active": 0, "suspended": 0, "deleted": 0, "unknown": 0},
         # Own stats - only this gateway's blobs
         "own_identity": own_identity[:16] + "..." if own_identity else "",
         "own_identity_hash": own_identity_hash,  # Full hash for backend matching
         "own_blobs": 0,
-        "own_by_status": {"active": 0, "suspended": 0, "unknown": 0},
+        "own_by_status": {"active": 0, "suspended": 0, "deleted": 0, "unknown": 0},
         "recent_events": recovery_events[-20:],  # Last 20 events
         "storage_summary": []
     }
@@ -1234,6 +1459,8 @@ async def get_peer_data_stats(s: WhisperState = Depends(get_state)):
         identity_stats = {
             "identity_hash": hashlib.sha256(identity.encode()).hexdigest()[:16],
             "blob_count": len(data["blobs"]),
+            "active_count": 0,
+            "tombstone_count": 0,
             "stored_at": data["stored_at"],
             "statuses": {},
             "is_own": is_own
@@ -1245,12 +1472,22 @@ async def get_peer_data_stats(s: WhisperState = Depends(get_state)):
             stats["by_status"][status] = stats["by_status"].get(status, 0) + 1
             identity_stats["statuses"][status] = identity_stats["statuses"].get(status, 0) + 1
             
+            # Track tombstones vs active
+            if status == "deleted":
+                identity_stats["tombstone_count"] += 1
+            elif status in ("active", "suspended"):
+                identity_stats["active_count"] += 1
+            
             # Count own blobs separately
             if is_own:
                 stats["own_blobs"] += 1
                 stats["own_by_status"][status] = stats["own_by_status"].get(status, 0) + 1
         
         stats["storage_summary"].append(identity_stats)
+    
+    # Add summary counts
+    stats["active_blobs"] = stats["by_status"].get("active", 0) + stats["by_status"].get("suspended", 0)
+    stats["tombstones"] = stats["by_status"].get("deleted", 0)
     
     return stats
 
@@ -1604,6 +1841,16 @@ def run_server():
     mesh_sync_thread = threading.Thread(target=mesh_sync_worker, daemon=True)
     mesh_sync_thread.start()
     logger.info("Periodic mesh sync worker started")
+    
+    # Start tombstone garbage collection worker
+    tombstone_gc_thread = threading.Thread(target=tombstone_gc_worker, daemon=True)
+    tombstone_gc_thread.start()
+    logger.info("Tombstone GC worker started")
+    
+    # Start orphan reconciliation worker (auto-cleanup of zombie blobs)
+    orphan_thread = threading.Thread(target=orphan_reconciliation_worker, daemon=True)
+    orphan_thread.start()
+    logger.info("Orphan reconciliation worker started")
     
     # Check for certificates
     if not os.path.exists(CERT_PATH):

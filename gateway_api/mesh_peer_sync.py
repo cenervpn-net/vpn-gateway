@@ -229,14 +229,12 @@ class MeshPeerSync:
         # Get mesh nodes if not provided
         if not mesh_nodes:
             await self._get_mesh_nodes()
-            # Include gateway nodes with pubkeys AND backend nodes (no pubkey required)
+            # Include ALL mesh nodes - both backend and gateway
+            # All nodes are just STORAGE - they receive the same payload
             mesh_nodes = {}
             for ip, info in self._mesh_nodes.items():
-                if info.get("type") == "backend":
-                    # Backend nodes use a placeholder identity (they store blobs as-is)
-                    mesh_nodes[ip] = info.get("name", f"backend-{ip}")
-                elif info.get("pubkey"):
-                    mesh_nodes[ip] = info.get("pubkey")
+                # Use name as identifier (pubkey not needed - nodes don't decrypt)
+                mesh_nodes[ip] = info.get("name", f"node-{ip}")
         
         if not mesh_nodes:
             logger.warning("No mesh nodes configured - skipping broadcast")
@@ -277,46 +275,27 @@ class MeshPeerSync:
             try:
                 ip, port = parse_peer_address(addr)
                 
-                # Check if this is a backend node (stores blobs as-is, no decryption)
+                # Check if this is a backend node (HTTP) or gateway (HTTPS)
                 is_backend = self._mesh_nodes.get(addr, {}).get("type") == "backend"
                 
-                if is_backend:
-                    # Backend nodes store blobs for recovery
-                    # Include self-wrapped key so we can decrypt our own blobs during recovery
-                    own_pubkey = self.identity.public_key_b64()
-                    self_wrapped = wrapped_keys.get(own_pubkey)
-                    
-                    payload = {
-                        "identity_pubkey": own_pubkey,
-                        "blob_hash": blob.blob_hash,
-                        "encrypted_blob": blob.encrypted_data,
-                        "blob_nonce": blob.nonce,
-                        "version": blob.version,
-                        "wrapped_key": self_wrapped.wrapped_key if self_wrapped else "",
-                        "wrapped_key_nonce": self_wrapped.nonce if self_wrapped else "",
-                        "timestamp": blob.timestamp,
-                        "signature": "",
-                        "peer_id": config_peer_id  # For status lookups
-                    }
-                else:
-                    # Gateway nodes need wrapped keys for decryption
-                    if mesh_peer_id not in wrapped_keys:
-                        logger.warning(f"No wrapped key for node {mesh_peer_id}")
-                        return
-                    
-                    wk = wrapped_keys[mesh_peer_id]
-                    payload = {
-                        "identity_pubkey": self.identity.public_key_b64(),
-                        "blob_hash": blob.blob_hash,
-                        "encrypted_blob": blob.encrypted_data,
-                        "blob_nonce": blob.nonce,
-                        "version": blob.version,
-                        "wrapped_key": wk.wrapped_key,
-                        "wrapped_key_nonce": wk.nonce,
-                        "timestamp": blob.timestamp,
-                        "signature": "",
-                        "peer_id": config_peer_id  # For status lookups
-                    }
+                # ALL mesh nodes (backend AND gateway) receive the SAME payload
+                # They are just STORAGE - they don't decrypt, only the OWNER decrypts
+                # Owner uses self-wrapped key during recovery
+                own_pubkey = self.identity.public_key_b64()
+                self_wrapped = wrapped_keys.get(own_pubkey)
+                
+                payload = {
+                    "identity_pubkey": own_pubkey,
+                    "blob_hash": blob.blob_hash,
+                    "encrypted_blob": blob.encrypted_data,
+                    "blob_nonce": blob.nonce,
+                    "version": blob.version,
+                    "wrapped_key": self_wrapped.wrapped_key if self_wrapped else "",
+                    "wrapped_key_nonce": self_wrapped.nonce if self_wrapped else "",
+                    "timestamp": blob.timestamp,
+                    "signature": "",
+                    "peer_id": config_peer_id  # For status lookups
+                }
                 
                 # Use HTTP for backend mesh nodes (no mTLS), HTTPS for gateways
                 protocol = "http" if is_backend else "https"
@@ -357,8 +336,16 @@ class MeshPeerSync:
             except Exception as e:
                 logger.warning(f"Failed to broadcast to {addr}: {e}")
         
-        # Send in parallel (to broadcast_targets, not ourselves)
-        tasks = [send_to_peer(ip, ip) for ip in broadcast_targets.keys()]
+        # Send in parallel - exclude ourselves from broadcast targets
+        own_name = os.environ.get("GATEWAY_NAME", "").lower()
+        tasks = []
+        for addr in broadcast_targets.keys():
+            node_name = self._mesh_nodes.get(addr, {}).get("name", "").lower()
+            if node_name and node_name == own_name:
+                continue  # Don't broadcast to ourselves
+            tasks.append(send_to_peer(addr, addr))
+        
+        total_count = len(tasks)  # Update total to exclude self
         await asyncio.gather(*tasks)
         
         logger.info(f"Broadcast peer config v{self._config_version} to {success_count}/{total_count} mesh nodes")
@@ -610,16 +597,19 @@ class MeshPeerSync:
     
     async def purge_peer_blob(self, peer_public_key: str) -> Tuple[int, int]:
         """
-        Purge a specific peer's blob from all mesh peers (on peer deletion).
+        Mark a specific peer's blob as tombstone on all mesh peers (on peer deletion).
         
-        This removes the actual data instead of creating tombstones,
-        preventing accumulation and ghost peer recovery.
+        Tombstones propagate during mesh sync, ensuring all nodes eventually
+        learn about deletions. Old tombstones are garbage collected after 7 days.
+        
+        This approach solves the consistency problem where deleted peers would
+        reappear when nodes synced with outdated data.
         
         Args:
             peer_public_key: The WireGuard public key of the deleted peer
         
         Returns:
-            Tuple of (success_count, total_count)
+            Tuple of (success_count, total_count) - nodes that acknowledged the tombstone
         """
         if not self.identity:
             raise RuntimeError("Mesh sync not initialized")
@@ -892,14 +882,37 @@ async def on_peer_updated(peer_config: dict):
 
 
 async def on_peer_deleted(peer_public_key: str):
-    """Called when a peer is deleted - purge blob from all mesh peers"""
-    # Instead of tombstones, we purge the actual blob data
-    # This prevents accumulation and ghost peer recovery
+    """
+    Called when a peer is deleted - mark blob as tombstone in all mesh peers.
+    
+    Tombstones propagate during sync to ensure all nodes learn about deletions.
+    This solves the consistency problem where deleted peers would reappear
+    when nodes synced with outdated data.
+    """
     try:
+        # First, mark as deleted in local store (if present)
+        try:
+            from whisper_node import peer_recovery_store
+            sync = await get_mesh_sync()
+            if sync.identity:
+                identity_key = sync.identity.public_key_b64()
+                if identity_key in peer_recovery_store:
+                    for blob in peer_recovery_store[identity_key].get("blobs", []):
+                        # Match by peer_id or blob_hash
+                        peer_id = hashlib.sha256(peer_public_key.encode()).hexdigest()
+                        if blob.get("peer_id") == peer_id:
+                            blob["status"] = "deleted"
+                            blob["deleted_at"] = datetime.now(timezone.utc).isoformat()
+                            logger.info(f"Marked local blob as tombstone for peer {peer_public_key[:16]}...")
+                            break
+        except Exception as local_err:
+            logger.debug(f"Could not update local store: {local_err}")
+        
+        # Then broadcast tombstone to all mesh peers
         sync = await get_mesh_sync()
         await sync.purge_peer_blob(peer_public_key)
     except Exception as e:
-        logger.error(f"Failed to purge peer blob from mesh: {e}")
+        logger.error(f"Failed to create tombstone for peer in mesh: {e}")
 
 
 async def on_peer_suspended(peer_public_key: str):
@@ -1089,7 +1102,8 @@ async def sync_from_mesh(target_store: dict = None) -> dict:
                     continue
                 seen_blobs.add(blob_hash)
                 
-                # Store locally
+                # Store locally with timestamp-based conflict resolution
+                # Tombstones propagate: if remote says "deleted", we accept if newer
                 try:
                     # Use provided store or import from whisper_node
                     if target_store is None:
@@ -1108,18 +1122,51 @@ async def sync_from_mesh(target_store: dict = None) -> dict:
                         results["synced_identities"] += 1
                     
                     # Check if blob already exists
-                    existing_hashes = [b.get("blob_hash") for b in store[identity]["blobs"]]
-                    if blob_hash not in existing_hashes:
+                    existing_blob = None
+                    existing_idx = None
+                    for idx, b in enumerate(store[identity]["blobs"]):
+                        if b.get("blob_hash") == blob_hash:
+                            existing_blob = b
+                            existing_idx = idx
+                            break
+                    
+                    remote_status = blob_data.get("status", "active")
+                    remote_timestamp = blob_data.get("timestamp", "") or blob_data.get("deleted_at", "")
+                    
+                    if existing_blob is None:
+                        # New blob - add it (including tombstones)
                         store[identity]["blobs"].append({
                             "blob_hash": blob_hash,
                             "encrypted_blob": blob_data.get("encrypted_blob", ""),
                             "blob_nonce": blob_data.get("blob_nonce", ""),
                             "version": blob_data.get("version", 1),
                             "timestamp": blob_data.get("timestamp", ""),
-                            "status": blob_data.get("status", "active"),
-                            "peer_id": blob_data.get("peer_id", "")
+                            "status": remote_status,
+                            "peer_id": blob_data.get("peer_id", ""),
+                            "deleted_at": blob_data.get("deleted_at", ""),
+                            "wrapped_key": blob_data.get("wrapped_key", ""),
+                            "wrapped_key_nonce": blob_data.get("wrapped_key_nonce", "")
                         })
                         results["synced_blobs"] += 1
+                    else:
+                        # Blob exists - compare timestamps, newer wins
+                        # This allows tombstones to propagate and overwrite active status
+                        local_status = existing_blob.get("status", "active")
+                        local_timestamp = existing_blob.get("timestamp", "") or existing_blob.get("deleted_at", "")
+                        
+                        # Parse timestamps for comparison
+                        try:
+                            remote_ts = datetime.fromisoformat(remote_timestamp.replace("Z", "+00:00")) if remote_timestamp else datetime.min.replace(tzinfo=timezone.utc)
+                            local_ts = datetime.fromisoformat(local_timestamp.replace("Z", "+00:00")) if local_timestamp else datetime.min.replace(tzinfo=timezone.utc)
+                            
+                            if remote_ts > local_ts:
+                                # Remote is newer - update our local copy
+                                store[identity]["blobs"][existing_idx]["status"] = remote_status
+                                if remote_status == "deleted":
+                                    store[identity]["blobs"][existing_idx]["deleted_at"] = blob_data.get("deleted_at", "")
+                                logger.debug(f"Updated blob {blob_hash[:8]} status: {local_status} -> {remote_status} (remote newer)")
+                        except Exception as ts_err:
+                            logger.debug(f"Timestamp comparison failed for {blob_hash[:8]}: {ts_err}")
                         
                 except Exception as e:
                     results["errors"].append(f"Failed to store blob {blob_hash[:8]}: {str(e)}")

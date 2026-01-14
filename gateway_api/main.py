@@ -344,11 +344,6 @@ async def create_configuration(
         try:
             decrypted_config, e2e_ctx = decrypt_e2e_request(config_data)
             
-            # Log decrypted config keys for debugging (no values!)
-            logger.info(f"E2E decrypted keys: {list(decrypted_config.keys())}")
-            logger.info(f"E2E tunnel_traffic: {decrypted_config.get('tunnel_traffic', 'NOT SET')}")
-            logger.info(f"E2E obfuscation_level: {decrypted_config.get('obfuscation_level', 'NOT SET')}")
-            
             # Update config with decrypted values
             if 'protocol' in decrypted_config:
                 config.protocol = decrypted_config['protocol']
@@ -379,6 +374,7 @@ async def create_configuration(
     # Add WireGuard peer
     obfuscation_params = config.obfuscation.dict() if config.obfuscation else None
     obf_level = getattr(config, 'obfuscation_level', None) or 'off'
+    
     success, assigned_ipv4, assigned_ipv6 = wg.add_peer(
         config.public_key,
         protocol=config.protocol,
@@ -611,14 +607,23 @@ async def delete_configuration(
     timestamp: str = Header(...)
 ):
     """Delete peer (RAM-only mode)"""
+    # Verify HMAC signature (empty body for DELETE)
+    verify_admin_request(signature, timestamp)
+    
     standard_key = public_key.replace('_', '/').replace('-', '+')
     if standard_key.endswith('%3D'):
         standard_key = standard_key[:-3] + '='
     
+    logger.info(f"Delete request for key: {standard_key[:20]}...")
+    
     # Find config in memory store
     config = peer_store.get(standard_key)
     if not config:
-        logger.error(f"Config not found for key: {standard_key}")
+        logger.warning(f"Config not found in peer_store for key: {standard_key[:20]}...")
+        # Still try to remove from WireGuard and mesh in case it exists there
+        wg.remove_peer(standard_key)
+        if MESH_SYNC_AVAILABLE:
+            background_tasks.add_task(on_peer_deleted, standard_key)
         raise HTTPException(status_code=404, detail="Configuration not found")
     
     standard_key = config.public_key
