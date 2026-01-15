@@ -17,11 +17,20 @@ class Settings(BaseSettings):
     WG_DEFAULT_PORT: int = 51820
 
     # DNS Configuration
-    DNS_SERVERS: Dict[str, str] = {
-        'd1': '1.1.1.1',    # Cloudflare
-        'd2': '8.8.8.8',    # Google
-        'd3': '9.9.9.9'     # Quad9
-    }
+    # Internal DNS IPs (gateway-local Unbound) - set by provisioning
+    # Falls back to external DNS if not configured
+    DNS_D1: str = "1.1.1.1"     # Default: Cloudflare (overridden to 10.65.1.1 when DNS deployed)
+    DNS_D2: str = "8.8.8.8"     # Default: Google (future: 10.65.1.2 with ad-blocking)
+    DNS_D3: str = "9.9.9.9"     # Default: Quad9 (future: 10.65.1.3 with max blocking)
+    
+    @property
+    def DNS_SERVERS(self) -> Dict[str, str]:
+        """Dynamic DNS mapping that uses internal DNS when available"""
+        return {
+            'd1': self.DNS_D1,
+            'd2': self.DNS_D2,
+            'd3': self.DNS_D3
+        }
 
     # RAM-only mode: No database - peers are stored in memory and recovered from mesh
 

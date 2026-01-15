@@ -344,11 +344,6 @@ async def create_configuration(
         try:
             decrypted_config, e2e_ctx = decrypt_e2e_request(config_data)
             
-            # Log decrypted config keys for debugging (no values!)
-            logger.info(f"E2E decrypted keys: {list(decrypted_config.keys())}")
-            logger.info(f"E2E tunnel_traffic: {decrypted_config.get('tunnel_traffic', 'NOT SET')}")
-            logger.info(f"E2E obfuscation_level: {decrypted_config.get('obfuscation_level', 'NOT SET')}")
-            
             # Update config with decrypted values
             if 'protocol' in decrypted_config:
                 config.protocol = decrypted_config['protocol']
@@ -379,6 +374,7 @@ async def create_configuration(
     # Add WireGuard peer
     obfuscation_params = config.obfuscation.dict() if config.obfuscation else None
     obf_level = getattr(config, 'obfuscation_level', None) or 'off'
+    
     success, assigned_ipv4, assigned_ipv6 = wg.add_peer(
         config.public_key,
         protocol=config.protocol,
@@ -611,14 +607,23 @@ async def delete_configuration(
     timestamp: str = Header(...)
 ):
     """Delete peer (RAM-only mode)"""
+    # Verify HMAC signature (empty body for DELETE)
+    verify_admin_request(signature, timestamp)
+    
     standard_key = public_key.replace('_', '/').replace('-', '+')
     if standard_key.endswith('%3D'):
         standard_key = standard_key[:-3] + '='
     
+    logger.info(f"Delete request for key: {standard_key[:20]}...")
+    
     # Find config in memory store
     config = peer_store.get(standard_key)
     if not config:
-        logger.error(f"Config not found for key: {standard_key}")
+        logger.warning(f"Config not found in peer_store for key: {standard_key[:20]}...")
+        # Still try to remove from WireGuard and mesh in case it exists there
+        wg.remove_peer(standard_key)
+        if MESH_SYNC_AVAILABLE:
+            background_tasks.add_task(on_peer_deleted, standard_key)
         raise HTTPException(status_code=404, detail="Configuration not found")
     
     standard_key = config.public_key
@@ -925,6 +930,82 @@ async def get_health_status(
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get health status: {str(e)}")
+
+
+@app.get("/api/v1/admin/health/dns")
+async def get_dns_health(
+    signature: str = Header(...),
+    timestamp: str = Header(...)
+):
+    """
+    Get DNS server health status.
+    Checks if Unbound DNS service is running and can resolve queries.
+    """
+    verify_admin_request(signature, timestamp)
+    
+    try:
+        import time
+        
+        # Check if unbound-d1 service is active
+        service_active = False
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", "unbound-d1"],
+                capture_output=True, text=True, timeout=5
+            )
+            service_active = result.returncode == 0 and result.stdout.strip() == "active"
+        except Exception as e:
+            logger.debug(f"Failed to check unbound-d1 service: {e}")
+        
+        # Measure DNS query latency (if service is active)
+        query_latency_ms = 0
+        upstream_reachable = False
+        
+        if service_active:
+            try:
+                start_time = time.time()
+                result = subprocess.run(
+                    ["dig", "@10.65.1.1", "google.com", "+short", "+timeout=3"],
+                    capture_output=True, text=True, timeout=5
+                )
+                end_time = time.time()
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    query_latency_ms = int((end_time - start_time) * 1000)
+                    upstream_reachable = True
+            except Exception as e:
+                logger.debug(f"DNS query test failed: {e}")
+        
+        # Determine overall DNS status
+        if not service_active:
+            dns_status = "not_deployed"
+        elif not upstream_reachable:
+            dns_status = "down"
+        elif query_latency_ms > 100:
+            dns_status = "slow"
+        else:
+            dns_status = "ok"
+        
+        return {
+            "dns_service_active": service_active,
+            "dns_query_latency_ms": query_latency_ms,
+            "dns_upstream_reachable": upstream_reachable,
+            "dns_status": dns_status,
+            "dns_last_check": datetime.now().isoformat(),
+            "dns_server_ip": "10.65.1.1" if service_active else None,
+            "dns_upstream": "9.9.9.9" if service_active else None
+        }
+        
+    except Exception as e:
+        logger.error(f"DNS health check failed: {str(e)}")
+        return {
+            "dns_service_active": False,
+            "dns_query_latency_ms": 0,
+            "dns_upstream_reachable": False,
+            "dns_status": "error",
+            "dns_last_check": datetime.now().isoformat(),
+            "error": str(e)
+        }
 
 
 @app.post("/api/v1/admin/recover-peers")
