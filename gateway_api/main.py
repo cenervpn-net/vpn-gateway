@@ -947,10 +947,11 @@ async def get_dns_health(
         import time
         
         # Check if unbound-d1 service is active
+        # NOTE: Use full paths for subprocess - systemd services have limited PATH
         service_active = False
         try:
             result = subprocess.run(
-                ["systemctl", "is-active", "unbound-d1"],
+                ["/usr/bin/systemctl", "is-active", "unbound-d1"],
                 capture_output=True, text=True, timeout=5
             )
             service_active = result.returncode == 0 and result.stdout.strip() == "active"
@@ -965,7 +966,7 @@ async def get_dns_health(
             try:
                 start_time = time.time()
                 result = subprocess.run(
-                    ["dig", "@10.65.1.1", "google.com", "+short", "+timeout=3"],
+                    ["/usr/bin/dig", "@10.65.1.1", "google.com", "+short", "+timeout=3"],
                     capture_output=True, text=True, timeout=5
                 )
                 end_time = time.time()
