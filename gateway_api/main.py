@@ -796,9 +796,11 @@ async def delete_configuration(
     if not config:
         logger.warning(f"Config not found in peer_store for key: {standard_key[:20]}...")
         # Still try to remove from WireGuard and mesh in case it exists there
-        wg.remove_peer(standard_key)
+        removed = wg.remove_peer(standard_key)
         if MESH_SYNC_AVAILABLE:
             background_tasks.add_task(on_peer_deleted, standard_key)
+        if removed:
+            return {"status": "deleted", "message": "Peer removed from WireGuard"}
         raise HTTPException(status_code=404, detail="Configuration not found")
     
     standard_key = config.public_key
