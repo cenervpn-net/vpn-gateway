@@ -100,6 +100,10 @@ async def startup_event():
                     if peer_config.get("_deleted"):
                         continue
                     
+                    # Skip tombstoned/deleted peers - they should not be recovered
+                    if peer_config.get("status") == "deleted":
+                        continue
+                    
                     public_key = peer_config.get("public_key")
                     if not public_key:
                         continue
@@ -1378,6 +1382,10 @@ async def recover_peers_from_mesh(
             for peer_config in result.recovered_configs:
                 try:
                     if peer_config.get("_deleted"):
+                        continue
+                    
+                    # Skip tombstoned/deleted peers - they should not be recovered
+                    if peer_config.get("status") == "deleted":
                         continue
                     
                     public_key = peer_config.get("public_key")
