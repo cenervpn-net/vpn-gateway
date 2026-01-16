@@ -626,8 +626,8 @@ class MeshPeerSync:
         
         await self._get_mesh_nodes()
         
-        # Hash the peer config to identify the blob
-        blob_hash = hash_peer_config({"public_key": peer_public_key})
+        # Generate peer_id for matching (hash of public_key config - same as when storing)
+        peer_id = hash_peer_config({"public_key": peer_public_key})
         
         success_count = 0
         total_count = len(self._mesh_nodes)
@@ -644,7 +644,7 @@ class MeshPeerSync:
                 
                 payload = {
                     "identity_pubkey": self.identity.public_key_b64(),
-                    "blob_hash": blob_hash,
+                    "peer_id": peer_id,  # Use peer_id for matching (hash of public_key)
                     "peer_public_key": peer_public_key,
                     "reason": "peer_deleted",
                     "timestamp": datetime.now(timezone.utc).isoformat()
@@ -666,7 +666,7 @@ class MeshPeerSync:
         tasks = [purge_from_peer(ip) for ip in self._mesh_nodes.keys()]
         await asyncio.gather(*tasks)
         
-        logger.info(f"Purged peer blob {blob_hash[:8]}... from {success_count}/{total_count} mesh peers")
+        logger.info(f"Purged peer blob (peer_id: {peer_id[:8]}...) from {success_count}/{total_count} mesh peers")
         return success_count, total_count
 
     async def purge_data_from_mesh(self, reason: str = "wipe") -> Tuple[int, int]:
