@@ -1048,10 +1048,9 @@ class PeerQueryRequest(BaseModel):
 @app.post("/whisper/peer-data/purge-blob")
 async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(get_state)):
     """
-    Purge a specific peer blob (on peer deletion).
+    Tombstone a specific peer blob (on peer deletion).
     
-    This is cleaner than tombstones - it removes the actual data
-    so deleted peers cannot be accidentally recovered.
+    We mark the blob as deleted to allow propagation across the mesh.
     
     Called by gateway when a peer is deleted.
     Matches by peer_id (preferred) or blob_hash.
@@ -1065,35 +1064,25 @@ async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(g
     if identity not in peer_recovery_store:
         return {"status": "not_found", "message": "No data for this identity"}
     
-    # Find and remove the specific blob
+    # Find and tombstone the specific blob
     blobs = peer_recovery_store[identity]["blobs"]
-    original_count = len(blobs)
+    tombstoned_count = 0
     
-    # Remove blobs matching by peer_id (preferred) or blob_hash
-    def should_keep(b):
-        # Match by peer_id if provided (preferred for deletion)
-        if peer_id and b.get("peer_id") == peer_id:
-            return False
-        # Match by blob_hash if provided
-        if blob_hash and b.get("blob_hash") == blob_hash:
-            return False
-        return True
+    for blob in blobs:
+        # Match by peer_id (preferred) or blob_hash
+        if (peer_id and blob.get("peer_id") == peer_id) or (blob_hash and blob.get("blob_hash") == blob_hash):
+            if blob.get("status") != "deleted":
+                blob["status"] = "deleted"
+                blob["deleted_at"] = datetime.now(timezone.utc).isoformat()
+                blob["status_updated_at"] = blob["deleted_at"]
+                tombstoned_count += 1
     
-    peer_recovery_store[identity]["blobs"] = [b for b in blobs if should_keep(b)]
-    
-    removed_count = original_count - len(peer_recovery_store[identity]["blobs"])
-    
-    # If no blobs left, clean up the identity entry
-    if not peer_recovery_store[identity]["blobs"]:
-        del peer_recovery_store[identity]
-        logger.info(f"Removed last blob for identity {identity[:16]}... - identity entry cleaned up")
-    
-    if removed_count > 0:
+    if tombstoned_count > 0:
         match_key = peer_id[:16] if peer_id else blob_hash[:16] if blob_hash else "unknown"
-        logger.info(f"PURGED blob (match: {match_key}...) for identity {identity[:16]}... - reason: {request.reason}")
+        logger.info(f"TOMBSTONED blob (match: {match_key}...) for identity {identity[:16]}... - reason: {request.reason}")
         
         recovery_events.append({
-            "type": "BLOB_PURGED",
+            "type": "BLOB_TOMBSTONED",
             "identity_hash": hashlib.sha256(identity.encode()).hexdigest()[:16],
             "peer_id": peer_id[:16] if peer_id else "",
             "blob_hash": blob_hash[:16] if blob_hash else "",
@@ -1101,7 +1090,7 @@ async def purge_peer_blob(request: PurgeBlobRequest, s: WhisperState = Depends(g
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
         
-        return {"status": "purged", "blobs_removed": removed_count}
+        return {"status": "tombstoned", "blobs_tombstoned": tombstoned_count}
     
     return {"status": "not_found", "message": "Blob not found"}
 

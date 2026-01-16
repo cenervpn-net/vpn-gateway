@@ -1077,52 +1077,64 @@ async def sync_from_mesh(target_store: dict = None) -> dict:
             wrapped_key = identity_data.get("wrapped_key", "")
             wrapped_key_nonce = identity_data.get("wrapped_key_nonce", "")
             stored_at = identity_data.get("stored_at", "")
-            
+
+            # Build incoming blob list (dedup across sources)
+            incoming_blobs = []
             for blob_data in blobs:
                 blob_hash = blob_data.get("blob_hash")
-                
                 if not blob_hash:
                     continue
-                
-                # Skip if we already have this blob
                 if blob_hash in seen_blobs:
                     continue
                 seen_blobs.add(blob_hash)
-                
-                # Store locally
-                try:
-                    # Use provided store or import from whisper_node
-                    if target_store is None:
-                        from whisper_node import peer_recovery_store
-                        store = peer_recovery_store
-                    else:
-                        store = target_store
-                    
-                    if identity not in store:
-                        store[identity] = {
-                            "blobs": [],
-                            "wrapped_key": wrapped_key,
-                            "wrapped_key_nonce": wrapped_key_nonce,
-                            "stored_at": stored_at or datetime.now(timezone.utc).isoformat()
-                        }
-                        results["synced_identities"] += 1
-                    
-                    # Check if blob already exists
-                    existing_hashes = [b.get("blob_hash") for b in store[identity]["blobs"]]
-                    if blob_hash not in existing_hashes:
-                        store[identity]["blobs"].append({
-                            "blob_hash": blob_hash,
-                            "encrypted_blob": blob_data.get("encrypted_blob", ""),
-                            "blob_nonce": blob_data.get("blob_nonce", ""),
-                            "version": blob_data.get("version", 1),
-                            "timestamp": blob_data.get("timestamp", ""),
-                            "status": blob_data.get("status", "active"),
-                            "peer_id": blob_data.get("peer_id", "")
-                        })
-                        results["synced_blobs"] += 1
-                        
-                except Exception as e:
-                    results["errors"].append(f"Failed to store blob {blob_hash[:8]}: {str(e)}")
+
+                incoming_blobs.append({
+                    "blob_hash": blob_hash,
+                    "encrypted_blob": blob_data.get("encrypted_blob", ""),
+                    "blob_nonce": blob_data.get("blob_nonce", ""),
+                    "version": blob_data.get("version", 1),
+                    "timestamp": blob_data.get("timestamp", ""),
+                    "status": blob_data.get("status", "active"),
+                    "peer_id": blob_data.get("peer_id", ""),
+                    "wrapped_key": blob_data.get("wrapped_key", ""),
+                    "wrapped_key_nonce": blob_data.get("wrapped_key_nonce", ""),
+                    "deleted_at": blob_data.get("deleted_at", ""),
+                    "status_updated_at": blob_data.get("status_updated_at", "")
+                })
+
+            # Store locally (reconcile for identities present in response)
+            try:
+                if target_store is None:
+                    from whisper_node import peer_recovery_store
+                    store = peer_recovery_store
+                else:
+                    store = target_store
+
+                previous_count = len(store.get(identity, {}).get("blobs", []))
+
+                if identity not in store:
+                    results["synced_identities"] += 1
+                    store[identity] = {
+                        "blobs": incoming_blobs,
+                        "wrapped_key": wrapped_key,
+                        "wrapped_key_nonce": wrapped_key_nonce,
+                        "stored_at": stored_at or datetime.now(timezone.utc).isoformat()
+                    }
+                    results["synced_blobs"] += len(incoming_blobs)
+                else:
+                    # Replace local cache for this identity with upstream view
+                    store[identity]["blobs"] = incoming_blobs
+                    store[identity]["wrapped_key"] = wrapped_key
+                    store[identity]["wrapped_key_nonce"] = wrapped_key_nonce
+                    if stored_at:
+                        store[identity]["stored_at"] = stored_at
+
+                    current_count = len(incoming_blobs)
+                    if current_count > previous_count:
+                        results["synced_blobs"] += current_count - previous_count
+
+            except Exception as e:
+                results["errors"].append(f"Failed to reconcile identity {identity[:8]}: {str(e)}")
     
     logger.info(f"Mesh sync complete: {results['synced_blobs']} blobs from {results['sources_queried']} sources")
     return results
