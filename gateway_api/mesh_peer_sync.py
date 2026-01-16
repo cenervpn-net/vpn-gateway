@@ -358,7 +358,8 @@ class MeshPeerSync:
                 logger.warning(f"Failed to broadcast to {addr}: {e}")
         
         # Send in parallel (to broadcast_targets, not ourselves)
-        tasks = [send_to_peer(ip, ip) for ip in broadcast_targets.keys()]
+        # addr is IP:port, pubkey is the node's identity public key
+        tasks = [send_to_peer(addr, pubkey) for addr, pubkey in broadcast_targets.items()]
         await asyncio.gather(*tasks)
         
         logger.info(f"Broadcast peer config v{self._config_version} to {success_count}/{total_count} mesh nodes")
