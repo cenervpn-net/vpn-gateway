@@ -969,10 +969,10 @@ async def query_suspended_peer(peer_public_key: str) -> Optional[dict]:
         return None
 
 
-async def recover_peers() -> RecoveryResult:
+async def recover_peers(require_quorum: bool = True) -> RecoveryResult:
     """Called during reprovisioning to recover peer configs"""
     sync = await get_mesh_sync()
-    return await sync.recover_peer_configs()
+    return await sync.recover_peer_configs(require_quorum=require_quorum)
 
 
 def get_own_identity_pubkey() -> str:

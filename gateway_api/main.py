@@ -1,6 +1,7 @@
 # gateway_api/main.py
 # RAM-ONLY MODE - No SQLite dependency
 import os
+import asyncio
 import subprocess
 import hmac
 import hashlib
@@ -48,6 +49,22 @@ try:
 except ImportError:
     MESH_SYNC_AVAILABLE = False
     logging.warning("Mesh peer sync not available - peer recovery disabled")
+
+
+def _parse_bool_env(value: str, default: bool = True) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+# Mesh reconciliation settings (apply mesh state to WG when gateway is online)
+MESH_RECONCILE_INTERVAL = int(os.environ.get("MESH_RECONCILE_INTERVAL", "60"))
+MESH_RECONCILE_REQUIRE_QUORUM = _parse_bool_env(
+    os.environ.get("MESH_RECONCILE_REQUIRE_QUORUM", "true"), default=True
+)
+MESH_RECONCILE_PRUNE_MISSING = _parse_bool_env(
+    os.environ.get("MESH_RECONCILE_PRUNE_MISSING", "true"), default=True
+)
 
 
 # Set up logging
@@ -242,6 +259,11 @@ async def startup_event():
         logger.info("IP tracking sync completed")
     except Exception as e:
         logger.warning(f"IP tracking sync failed (non-fatal): {e}")
+
+    # Start mesh reconciliation loop (apply mesh state to WG when online)
+    if MESH_SYNC_AVAILABLE and MESH_RECONCILE_INTERVAL > 0:
+        asyncio.create_task(mesh_reconcile_loop())
+        logger.info(f"Mesh reconcile loop started (interval={MESH_RECONCILE_INTERVAL}s)")
     
     # Load CRL for mesh security enforcement
     if load_crl_from_disk():
@@ -318,6 +340,159 @@ async def mesh_resume_task(public_key: str):
         logger.info(f"Mesh status updated to active for peer: {public_key[:20]}...")
     except Exception as e:
         logger.warning(f"Failed to update mesh status for resume: {e}")
+
+
+def _normalize_tunnel_traffic(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        if value == "all":
+            return ["ipv4", "ipv6"]
+        if value:
+            return [value]
+    return ["ipv4"]
+
+
+def _normalize_allowed_ips(value):
+    if isinstance(value, list):
+        return ",".join(value)
+    return value or ""
+
+
+def _peer_config_from_mesh(mesh_config: dict, status_override: Optional[str] = None) -> PeerConfig:
+    status = status_override or mesh_config.get("status", "active")
+    return PeerConfig(
+        public_key=mesh_config.get("public_key", ""),
+        status=status,
+        assigned_ip=mesh_config.get("assigned_ip", ""),
+        assigned_ipv6=mesh_config.get("assigned_ipv6", ""),
+        assigned_port=int(mesh_config.get("assigned_port") or 0),
+        tunnel_traffic=_normalize_tunnel_traffic(mesh_config.get("tunnel_traffic", "all")),
+        dns_choice=mesh_config.get("dns_choice", ""),
+        allowed_ips=_normalize_allowed_ips(mesh_config.get("allowed_ips", "")),
+        obfuscation_level=mesh_config.get("obfuscation_level", "off"),
+        obfuscation_enabled=mesh_config.get("obfuscation_enabled", False),
+        junk_packet_count=mesh_config.get("junk_packet_count", 0),
+        junk_packet_min_size=mesh_config.get("junk_packet_min_size", 0),
+        junk_packet_max_size=mesh_config.get("junk_packet_max_size", 0),
+        init_packet_junk_size=mesh_config.get("init_packet_junk_size", 0),
+        response_packet_junk_size=mesh_config.get("response_packet_junk_size", 0),
+        underload_packet_junk_size=mesh_config.get("underload_packet_junk_size", 0),
+        transport_packet_junk_size=mesh_config.get("transport_packet_junk_size", 0),
+        init_packet_magic_header=mesh_config.get("init_packet_magic_header", 0),
+        response_packet_magic_header=mesh_config.get("response_packet_magic_header", 0),
+        underload_packet_magic_header=mesh_config.get("underload_packet_magic_header", 0),
+        transport_packet_magic_header=mesh_config.get("transport_packet_magic_header", 0)
+    )
+
+
+async def reconcile_peers_from_mesh():
+    """
+    Reconcile local peers with mesh state.
+    Mesh is authoritative; stale peers are removed when enabled.
+    """
+    if not MESH_SYNC_AVAILABLE or not peer_store.is_initialized:
+        return {
+            "status": "unavailable",
+            "message": "Mesh sync not available or peer store not initialized"
+        }
+
+    result = await recover_peers(require_quorum=MESH_RECONCILE_REQUIRE_QUORUM)
+    if not result.success:
+        logger.warning(f"Mesh reconcile skipped: {result.message}")
+        return {
+            "status": "skipped",
+            "message": result.message
+        }
+
+    mesh_configs = [c for c in result.recovered_configs if c.get("public_key")]
+    mesh_by_key = {c["public_key"]: c for c in mesh_configs}
+    mesh_keys = set(mesh_by_key.keys())
+
+    applied_active = 0
+    applied_suspended = 0
+    applied_deleted = 0
+
+    for public_key, cfg in mesh_by_key.items():
+        status = cfg.get("status", "active")
+
+        if status == "deleted":
+            if wg.verify_peer_exists(public_key):
+                wg.remove_peer(public_key)
+            if peer_store.exists(public_key):
+                peer_store.delete(public_key)
+            applied_deleted += 1
+            continue
+
+        if status == "suspended":
+            if wg.verify_peer_exists(public_key):
+                wg.remove_peer(public_key)
+            if peer_store.exists(public_key):
+                peer_store.update(public_key, status="suspended")
+            else:
+                peer_store.add(_peer_config_from_mesh(cfg, status_override="suspended"))
+            applied_suspended += 1
+            continue
+
+        # Active peers
+        if peer_store.exists(public_key):
+            peer_store.update(public_key, status="active")
+        else:
+            peer_store.add(_peer_config_from_mesh(cfg, status_override="active"))
+
+        if not wg.verify_peer_exists(public_key):
+            assigned_ip = cfg.get("assigned_ip") or None
+            assigned_ipv6 = cfg.get("assigned_ipv6") or None
+            if not assigned_ip and not assigned_ipv6:
+                logger.warning(f"Mesh peer missing IPs: {public_key[:20]}... (skip add)")
+            else:
+                obf_level = cfg.get("obfuscation_level", "off") or "off"
+                success, _, _ = wg.add_peer(
+                    public_key,
+                    protocol='dual' if assigned_ipv6 else None,
+                    tunnel_traffic=_normalize_tunnel_traffic(cfg.get("tunnel_traffic", "all")),
+                    port=int(cfg.get("assigned_port") or 0),
+                    assigned_ipv4=assigned_ip,
+                    assigned_ipv6=assigned_ipv6,
+                    obfuscation_level=obf_level
+                )
+                if not success:
+                    logger.warning(f"Failed to activate mesh peer: {public_key[:20]}...")
+        applied_active += 1
+
+    if MESH_RECONCILE_PRUNE_MISSING:
+        for peer in peer_store.get_all():
+            if peer.public_key not in mesh_keys:
+                if wg.verify_peer_exists(peer.public_key):
+                    wg.remove_peer(peer.public_key)
+                peer_store.delete(peer.public_key)
+                applied_deleted += 1
+
+    logger.info(
+        "Mesh reconcile complete: active=%d suspended=%d deleted=%d",
+        applied_active, applied_suspended, applied_deleted
+    )
+
+    return {
+        "status": "ok",
+        "mesh_total": len(mesh_configs),
+        "applied_active": applied_active,
+        "applied_suspended": applied_suspended,
+        "applied_deleted": applied_deleted
+    }
+
+
+async def mesh_reconcile_loop():
+    if MESH_RECONCILE_INTERVAL <= 0:
+        return
+    # Small delay to allow startup recovery to finish
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await reconcile_peers_from_mesh()
+        except Exception as e:
+            logger.warning(f"Mesh reconcile error: {e}")
+        await asyncio.sleep(MESH_RECONCILE_INTERVAL)
 
 @app.post("/api/v1/configurations/")
 async def create_configuration(
@@ -1009,6 +1184,171 @@ async def get_dns_health(
         }
 
 
+@app.get("/api/v1/admin/health/dns/{level}")
+async def get_dns_health_by_level(
+    level: str,
+    signature: str = Header(...),
+    timestamp: str = Header(...)
+):
+    """
+    Get DNS server health status for a specific level (d1, d2, d3).
+    """
+    verify_admin_request(signature, timestamp)
+    
+    # DNS configuration by level
+    dns_config = {
+        "d1": {"ip": "10.65.1.1", "name": "Clean", "service": "unbound-d1"},
+        "d2": {"ip": "10.65.1.2", "name": "Ad-Block", "service": "unbound-d2"},
+        "d3": {"ip": "10.65.1.3", "name": "Maximum", "service": "unbound-d3"},
+    }
+    
+    if level not in dns_config:
+        return {"error": f"Unknown DNS level: {level}", "valid_levels": list(dns_config.keys())}
+    
+    config = dns_config[level]
+    
+    try:
+        import time
+        
+        # Check if service is active
+        service_active = False
+        try:
+            result = subprocess.run(
+                ["/usr/bin/systemctl", "is-active", config["service"]],
+                capture_output=True, text=True, timeout=5
+            )
+            service_active = result.returncode == 0 and result.stdout.strip() == "active"
+        except Exception as e:
+            logger.debug(f"Failed to check {config['service']} service: {e}")
+        
+        # Measure DNS query latency
+        query_latency_ms = 0
+        upstream_reachable = False
+        blocked_domains = 0
+        blocklist_version = None
+        
+        if service_active:
+            try:
+                start_time = time.time()
+                result = subprocess.run(
+                    ["/usr/bin/dig", f"@{config['ip']}", "google.com", "+short", "+timeout=3"],
+                    capture_output=True, text=True, timeout=5
+                )
+                end_time = time.time()
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    query_latency_ms = int((end_time - start_time) * 1000)
+                    upstream_reachable = True
+            except Exception as e:
+                logger.debug(f"DNS query test failed for {level}: {e}")
+            
+            # For d2/d3, check blocklist info
+            if level in ["d2", "d3"]:
+                try:
+                    blocklist_path = f"/dev/shm/dns/blocklist-{level}.conf"
+                    result = subprocess.run(
+                        ["/usr/bin/wc", "-l", blocklist_path],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0:
+                        # Each line is a local-zone entry (minus header)
+                        blocked_domains = max(0, int(result.stdout.split()[0]) - 10)
+                    
+                    # Try to read version from config comment
+                    result = subprocess.run(
+                        ["/usr/bin/head", "-5", blocklist_path],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if "Generated:" in result.stdout:
+                        for line in result.stdout.split('\n'):
+                            if "Generated:" in line:
+                                blocklist_version = line.split("Generated:")[1].strip()
+                                break
+                except Exception as e:
+                    logger.debug(f"Failed to get blocklist info for {level}: {e}")
+        
+        # Determine status
+        if not service_active:
+            dns_status = "not_deployed"
+        elif not upstream_reachable:
+            dns_status = "down"
+        elif query_latency_ms > 100:
+            dns_status = "slow"
+        else:
+            dns_status = "ok"
+        
+        response = {
+            "level": level,
+            "name": config["name"],
+            "dns_service_active": service_active,
+            "dns_query_latency_ms": query_latency_ms,
+            "dns_upstream_reachable": upstream_reachable,
+            "dns_status": dns_status,
+            "dns_server_ip": config["ip"] if service_active else None,
+            "dns_last_check": datetime.now().isoformat()
+        }
+        
+        # Add blocklist info for d2/d3
+        if level in ["d2", "d3"]:
+            response["blocked_domains"] = blocked_domains
+            response["blocklist_version"] = blocklist_version
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"DNS health check failed for {level}: {str(e)}")
+        return {
+            "level": level,
+            "dns_service_active": False,
+            "dns_status": "error",
+            "dns_last_check": datetime.now().isoformat(),
+            "error": str(e)
+        }
+
+
+@app.get("/api/v1/admin/health/dns/all")
+async def get_all_dns_health(
+    signature: str = Header(...),
+    timestamp: str = Header(...)
+):
+    """
+    Get health status for all DNS levels (d1, d2, d3).
+    """
+    verify_admin_request(signature, timestamp)
+    
+    results = {}
+    for level in ["d1", "d2", "d3"]:
+        # Reuse the level-specific function logic
+        dns_config = {
+            "d1": {"ip": "10.65.1.1", "name": "Clean", "service": "unbound-d1"},
+            "d2": {"ip": "10.65.1.2", "name": "Ad-Block", "service": "unbound-d2"},
+            "d3": {"ip": "10.65.1.3", "name": "Maximum", "service": "unbound-d3"},
+        }
+        config = dns_config[level]
+        
+        service_active = False
+        try:
+            result = subprocess.run(
+                ["/usr/bin/systemctl", "is-active", config["service"]],
+                capture_output=True, text=True, timeout=5
+            )
+            service_active = result.returncode == 0 and result.stdout.strip() == "active"
+        except:
+            pass
+        
+        results[level] = {
+            "name": config["name"],
+            "ip": config["ip"],
+            "active": service_active,
+            "status": "ok" if service_active else "not_deployed"
+        }
+    
+    return {
+        "dns_levels": results,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
 @app.post("/api/v1/admin/recover-peers")
 async def recover_peers_from_mesh(
     background_tasks: BackgroundTasks,
@@ -1135,6 +1475,26 @@ async def recover_peers_from_mesh(
     except Exception as e:
         logger.error(f"Peer recovery failed: {e}")
         raise HTTPException(status_code=500, detail=f"Peer recovery failed: {str(e)}")
+
+
+@app.post("/api/v1/admin/reconcile-peers")
+async def reconcile_peers_admin(
+    signature: str = Header(...),
+    timestamp: str = Header(...)
+):
+    """
+    Reconcile peers from mesh and apply to WireGuard immediately.
+    This is a manual "reconcile now" action for online gateways.
+    """
+    verify_admin_request(signature, timestamp)
+
+    if not MESH_SYNC_AVAILABLE:
+        return {
+            "status": "unavailable",
+            "message": "Mesh peer sync not available on this gateway"
+        }
+
+    return await reconcile_peers_from_mesh()
 
 
 @app.post("/api/v1/admin/reboot")
@@ -1493,3 +1853,319 @@ async def wipe_gateway(
     except Exception as e:
         logger.error(f"Wipe failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Wipe failed: {str(e)}")
+
+
+# ============================================================================
+# ANONYMOUS DNS USAGE STATS (with Lap feature)
+# ============================================================================
+
+# In-memory lap storage (resets on gateway API restart)
+dns_laps: list[dict] = []
+MAX_LAPS = 20  # Keep last 20 laps
+
+
+def parse_unbound_stats(output: str) -> dict:
+    """Parse unbound-control stats output into a dict"""
+    stats = {}
+    for line in output.strip().split('\n'):
+        if '=' in line:
+            key, value = line.split('=', 1)
+            try:
+                # Try to parse as number
+                if '.' in value:
+                    stats[key] = float(value)
+                else:
+                    stats[key] = int(value)
+            except ValueError:
+                stats[key] = value
+    return stats
+
+
+def get_unbound_stats(level: str) -> dict:
+    """Get stats from unbound-control for a specific level"""
+    port_map = {"d1": 8941, "d2": 8942, "d3": 8943}
+    port = port_map.get(level, 8941)
+    
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/unbound-control", "-s", f"127.0.0.1@{port}", "stats_noreset"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return parse_unbound_stats(result.stdout)
+    except Exception as e:
+        logger.debug(f"Error getting unbound stats for {level}: {e}")
+    return {}
+
+
+@app.get("/api/v1/dns/stats")
+async def get_dns_stats():
+    """
+    Anonymous DNS usage statistics.
+    Returns only aggregate counts - no user data, IPs, or identifiable info.
+    """
+    dns_levels = {
+        "d1": {"ip": "10.65.1.1", "name": "Clean", "port": 8941},
+        "d2": {"ip": "10.65.1.2", "name": "Ad-Block", "port": 8942},
+        "d3": {"ip": "10.65.1.3", "name": "Maximum", "port": 8943},
+    }
+    
+    stats = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "gateway": os.getenv("GATEWAY_NAME", "unknown"),
+        "levels": {}
+    }
+    
+    total_queries = 0
+    total_blocked = 0
+    total_cache_hits = 0
+    total_cache_miss = 0
+    
+    for level, config in dns_levels.items():
+        level_stats = {
+            "name": config["name"],
+            "ip": config["ip"],
+            "active": False,
+            "queries": 0,
+            "cache_hits": 0,
+            "cache_miss": 0,
+            "blocked": 0,
+            "avg_response_ms": 0,
+        }
+        
+        try:
+            # Check if service is active
+            result = subprocess.run(
+                ["/usr/bin/systemctl", "is-active", f"unbound-{level}"],
+                capture_output=True, text=True, timeout=3
+            )
+            level_stats["active"] = result.returncode == 0
+            
+            if level_stats["active"]:
+                # Get detailed stats from unbound-control
+                unbound_stats = get_unbound_stats(level)
+                
+                if unbound_stats:
+                    # Aggregate thread stats
+                    queries = unbound_stats.get("total.num.queries", 0)
+                    cache_hits = unbound_stats.get("total.num.cachehits", 0)
+                    cache_miss = unbound_stats.get("total.num.cachemiss", 0)
+                    
+                    # For blocked queries, count NXDOMAIN responses (blocked domains return NXDOMAIN)
+                    # In Unbound with local-zone static, blocked = queries that hit blocklist
+                    nxdomain = unbound_stats.get("num.answer.rcode.NXDOMAIN", 0)
+                    
+                    # Average response time (recursion time in seconds -> ms)
+                    avg_time = unbound_stats.get("total.recursion.time.avg", 0)
+                    
+                    level_stats["queries"] = queries
+                    level_stats["cache_hits"] = cache_hits
+                    level_stats["cache_miss"] = cache_miss
+                    level_stats["blocked"] = nxdomain if level != "d1" else 0  # d1 has no blocklist
+                    level_stats["avg_response_ms"] = round(avg_time * 1000, 2)
+                    
+                    # Calculate cache hit rate
+                    if queries > 0:
+                        level_stats["cache_hit_rate"] = round((cache_hits / queries) * 100, 1)
+                    else:
+                        level_stats["cache_hit_rate"] = 0
+                    
+                    total_queries += queries
+                    total_cache_hits += cache_hits
+                    total_cache_miss += cache_miss
+                    if level != "d1":
+                        total_blocked += nxdomain
+                
+        except Exception as e:
+            logger.debug(f"Error getting stats for {level}: {e}")
+        
+        stats["levels"][level] = level_stats
+    
+    # Totals
+    stats["totals"] = {
+        "queries": total_queries,
+        "cache_hits": total_cache_hits,
+        "cache_miss": total_cache_miss,
+        "blocked": total_blocked,
+        "cache_hit_rate": round((total_cache_hits / max(total_queries, 1)) * 100, 1),
+    }
+    
+    # Summary
+    stats["summary"] = {
+        "active_levels": sum(1 for l in stats["levels"].values() if l["active"]),
+    }
+    
+    return stats
+
+
+@app.get("/api/v1/dns/stats/summary")
+async def get_dns_stats_summary():
+    """
+    Minimal anonymous DNS stats summary.
+    """
+    try:
+        full_stats = await get_dns_stats()
+        return {
+            "timestamp": full_stats["timestamp"],
+            "gateway": full_stats["gateway"],
+            "total_queries": full_stats["totals"]["queries"],
+            "total_blocked": full_stats["totals"]["blocked"],
+            "cache_hit_rate": full_stats["totals"]["cache_hit_rate"],
+            "active_levels": full_stats["summary"]["active_levels"],
+            "levels": {k: {
+                "active": v["active"],
+                "queries": v["queries"],
+                "blocked": v["blocked"],
+                "cache_hit_rate": v.get("cache_hit_rate", 0)
+            } for k, v in full_stats["levels"].items()}
+        }
+    except Exception as e:
+        return {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "error": str(e)
+        }
+
+
+# ============================================================================
+# DNS STATS LAPS - Like a chronometer
+# ============================================================================
+
+@app.post("/api/v1/dns/stats/lap")
+async def create_dns_lap(name: str = None):
+    """
+    Create a new lap - snapshot current stats.
+    Like pressing 'lap' on a chronometer.
+    """
+    global dns_laps
+    
+    # Get current cumulative stats
+    current_stats = await get_dns_stats()
+    
+    lap_number = len(dns_laps) + 1
+    lap = {
+        "lap_number": lap_number,
+        "name": name or f"Lap {lap_number}",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "snapshot": {
+            "totals": current_stats["totals"].copy(),
+            "levels": {k: {
+                "queries": v["queries"],
+                "blocked": v["blocked"],
+                "cache_hits": v["cache_hits"],
+            } for k, v in current_stats["levels"].items()}
+        }
+    }
+    
+    dns_laps.append(lap)
+    
+    # Keep only last MAX_LAPS
+    if len(dns_laps) > MAX_LAPS:
+        dns_laps = dns_laps[-MAX_LAPS:]
+    
+    return {
+        "message": f"Lap {lap_number} created",
+        "lap": lap,
+        "total_laps": len(dns_laps)
+    }
+
+
+@app.get("/api/v1/dns/stats/laps")
+async def get_dns_laps():
+    """
+    Get all laps with deltas from previous lap.
+    """
+    current_stats = await get_dns_stats()
+    
+    laps_with_deltas = []
+    
+    for i, lap in enumerate(dns_laps):
+        # Previous reference: either previous lap or zero
+        if i == 0:
+            prev_totals = {"queries": 0, "blocked": 0, "cache_hits": 0}
+        else:
+            prev_totals = dns_laps[i-1]["snapshot"]["totals"]
+        
+        # Calculate delta for this lap interval
+        lap_delta = {
+            "queries": lap["snapshot"]["totals"]["queries"] - prev_totals.get("queries", 0),
+            "blocked": lap["snapshot"]["totals"]["blocked"] - prev_totals.get("blocked", 0),
+            "cache_hits": lap["snapshot"]["totals"]["cache_hits"] - prev_totals.get("cache_hits", 0),
+        }
+        
+        laps_with_deltas.append({
+            **lap,
+            "delta_from_previous": lap_delta
+        })
+    
+    # Calculate "current" (since last lap)
+    current_delta = None
+    if dns_laps:
+        last_lap = dns_laps[-1]
+        current_delta = {
+            "queries": current_stats["totals"]["queries"] - last_lap["snapshot"]["totals"]["queries"],
+            "blocked": current_stats["totals"]["blocked"] - last_lap["snapshot"]["totals"]["blocked"],
+            "cache_hits": current_stats["totals"]["cache_hits"] - last_lap["snapshot"]["totals"]["cache_hits"],
+        }
+    
+    return {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "gateway": os.getenv("GATEWAY_NAME", "unknown"),
+        "cumulative": current_stats["totals"],
+        "since_last_lap": current_delta,
+        "laps": laps_with_deltas,
+        "total_laps": len(dns_laps)
+    }
+
+
+@app.delete("/api/v1/dns/stats/laps")
+async def clear_dns_laps():
+    """
+    Clear all laps (reset chronometer, but cumulative stats remain).
+    """
+    global dns_laps
+    count = len(dns_laps)
+    dns_laps = []
+    return {
+        "message": f"Cleared {count} laps",
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+
+
+@app.get("/api/v1/dns/stats/since/{lap_number}")
+async def get_stats_since_lap(lap_number: int):
+    """
+    Get stats delta since a specific lap.
+    """
+    if lap_number < 1 or lap_number > len(dns_laps):
+        return {"error": f"Invalid lap number. Valid: 1-{len(dns_laps)}"}
+    
+    lap = dns_laps[lap_number - 1]
+    current_stats = await get_dns_stats()
+    
+    delta = {
+        "queries": current_stats["totals"]["queries"] - lap["snapshot"]["totals"]["queries"],
+        "blocked": current_stats["totals"]["blocked"] - lap["snapshot"]["totals"]["blocked"],
+        "cache_hits": current_stats["totals"]["cache_hits"] - lap["snapshot"]["totals"]["cache_hits"],
+    }
+    
+    # Per-level delta
+    level_deltas = {}
+    for level in ["d1", "d2", "d3"]:
+        if level in current_stats["levels"] and level in lap["snapshot"]["levels"]:
+            level_deltas[level] = {
+                "queries": current_stats["levels"][level]["queries"] - lap["snapshot"]["levels"][level]["queries"],
+                "blocked": current_stats["levels"][level]["blocked"] - lap["snapshot"]["levels"][level]["blocked"],
+            }
+    
+    return {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "gateway": os.getenv("GATEWAY_NAME", "unknown"),
+        "since_lap": {
+            "number": lap_number,
+            "name": lap["name"],
+            "timestamp": lap["timestamp"]
+        },
+        "delta": delta,
+        "level_deltas": level_deltas,
+        "cumulative": current_stats["totals"]
+    }
