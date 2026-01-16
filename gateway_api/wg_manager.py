@@ -129,7 +129,7 @@ class WireGuardManager:
         
         try:
             network = ipaddress.ip_network(subnet_str, strict=False)
-            # Get existing peers to avoid conflicts
+            # Get existing peers to avoid conflicts (all interfaces use same logic)
             existing_ips = set()
             try:
                 result = subprocess.run(
@@ -137,12 +137,40 @@ class WireGuardManager:
                     capture_output=True, text=True
                 )
                 for line in result.stdout.strip().split("\n"):
+                    if not line.strip():
+                        continue
+                    # Format: <pubkey>\t<ip1>,<ip2>,... (IPv4/IPv6 mixed)
                     parts = line.split()
-                    if len(parts) >= 2:
-                        for ip_cidr in parts[1].split(","):
-                            ip = ip_cidr.split("/")[0]
-                            existing_ips.add(ip)
+                    if len(parts) < 2:
+                        continue
+                    ip_list = parts[1].split(",")
+                    for ip_cidr in ip_list:
+                        ip = ip_cidr.split("/")[0].strip()
+                        if not ip:
+                            continue
+                        if ip_type == 'ipv4' and ":" in ip:
+                            continue
+                        if ip_type == 'ipv6' and ":" not in ip:
+                            continue
+                        existing_ips.add(ip)
             except:
+                pass
+            
+            # Merge in-memory allocations (handles cases where WG lost allowed-ips)
+            try:
+                from peer_store import get_peer_store
+                store = get_peer_store()
+                for peer in store.get_all():
+                    candidate = peer.assigned_ip if ip_type == 'ipv4' else peer.assigned_ipv6
+                    if not candidate:
+                        continue
+                    try:
+                        candidate_ip = ipaddress.ip_address(candidate)
+                    except ValueError:
+                        continue
+                    if candidate_ip in network:
+                        existing_ips.add(str(candidate_ip))
+            except Exception:
                 pass
             
             # Find next available IP (skip .0, .1 - gateway address)

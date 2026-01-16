@@ -883,7 +883,7 @@ async def store_secure_peer_data(data: SecurePeerData, s: WhisperState = Depends
     existing_hashes = [b["blob_hash"] for b in peer_recovery_store[identity]["blobs"]]
     
     if data.blob_hash not in existing_hashes:
-        # Store the blob
+        # Store the blob (include per-blob wrapped key for recovery)
         peer_recovery_store[identity]["blobs"].append({
             "blob_hash": data.blob_hash,
             "encrypted_blob": data.encrypted_blob,
@@ -891,7 +891,9 @@ async def store_secure_peer_data(data: SecurePeerData, s: WhisperState = Depends
             "version": data.version,
             "timestamp": data.timestamp,
             "status": "active",  # Default status
-            "peer_id": data.peer_id  # For status lookups
+            "peer_id": data.peer_id,  # For status lookups
+            "wrapped_key": data.wrapped_key,
+            "wrapped_key_nonce": data.wrapped_key_nonce
         })
         
         # Update wrapped key if newer version
